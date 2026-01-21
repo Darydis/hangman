@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Dict
+import sqlite3
+from datetime import datetime, timezone
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
 from telegram import Update, MessageEntity
@@ -25,6 +27,219 @@ log = logging.getLogger("hangman-bot")
 GAMES: Dict[int, HangmanGame] = {}
 # Ожидание слова: user_id -> target_chat_id
 WAITING_WORD: Dict[int, int] = {}
+# Попытки пользователей в текущих играх: chat_id -> user_id -> attempts
+ATTEMPTS: Dict[int, Dict[int, int]] = {}
+
+DB_PATH = os.getenv("HANGMAN_DB_PATH", "hangman.db")
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db() -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS word_records (
+                word TEXT PRIMARY KEY,
+                best_user_id INTEGER,
+                best_attempts INTEGER,
+                worst_user_id INTEGER,
+                worst_attempts INTEGER,
+                total_games INTEGER NOT NULL
+            )
+            """
+        )
+
+def _upsert_user(conn: sqlite3.Connection, user) -> None:
+    conn.execute(
+        """
+        INSERT INTO users (user_id, username, first_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name
+        """,
+        (user.id, user.username, user.first_name),
+    )
+
+def _get_user_label(conn: sqlite3.Connection, user_id: int) -> str:
+    row = conn.execute(
+        "SELECT username, first_name FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if row and row["username"]:
+        return f"@{row['username']}"
+    if row and row["first_name"]:
+        return row["first_name"]
+    return f"user {user_id}"
+
+def _fetch_word_record(conn: sqlite3.Connection, word_key: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT word, best_user_id, best_attempts, worst_user_id, worst_attempts, total_games
+        FROM word_records
+        WHERE word = ?
+        """,
+        (word_key,),
+    ).fetchone()
+
+def _update_word_record(
+    conn: sqlite3.Connection,
+    word_key: str,
+    winner_user_id: Optional[int],
+    winner_attempts: Optional[int],
+    has_winner: bool,
+) -> Dict[str, Optional[int]]:
+    record = _fetch_word_record(conn, word_key)
+    if record is None:
+        best_user_id = winner_user_id if has_winner else None
+        best_attempts = winner_attempts if has_winner else None
+        worst_user_id = winner_user_id if has_winner else None
+        worst_attempts = winner_attempts if has_winner else None
+        total_games = 1
+        conn.execute(
+            """
+            INSERT INTO word_records
+            (word, best_user_id, best_attempts, worst_user_id, worst_attempts, total_games)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (word_key, best_user_id, best_attempts, worst_user_id, worst_attempts, total_games),
+        )
+        return {
+            "best_user_id": best_user_id,
+            "best_attempts": best_attempts,
+            "worst_user_id": worst_user_id,
+            "worst_attempts": worst_attempts,
+            "total_games": total_games,
+        }
+
+    best_user_id = record["best_user_id"]
+    best_attempts = record["best_attempts"]
+    worst_user_id = record["worst_user_id"]
+    worst_attempts = record["worst_attempts"]
+    total_games = record["total_games"] + 1
+
+    if has_winner and winner_attempts is not None:
+        if best_attempts is None or winner_attempts < best_attempts:
+            best_attempts = winner_attempts
+            best_user_id = winner_user_id
+        if worst_attempts is None or winner_attempts > worst_attempts:
+            worst_attempts = winner_attempts
+            worst_user_id = winner_user_id
+
+    conn.execute(
+        """
+        UPDATE word_records
+        SET best_user_id = ?, best_attempts = ?, worst_user_id = ?, worst_attempts = ?, total_games = ?
+        WHERE word = ?
+        """,
+        (best_user_id, best_attempts, worst_user_id, worst_attempts, total_games, word_key),
+    )
+    return {
+        "best_user_id": best_user_id,
+        "best_attempts": best_attempts,
+        "worst_user_id": worst_user_id,
+        "worst_attempts": worst_attempts,
+        "total_games": total_games,
+    }
+
+def _record_game_results(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    word_key: str,
+    participants: Dict[int, int],
+    winner_user_id: Optional[int],
+) -> None:
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for user_id, attempts in participants.items():
+        result = "win" if winner_user_id is not None and user_id == winner_user_id else "lose"
+        conn.execute(
+            """
+            INSERT INTO games (chat_id, word, user_id, attempts, result, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, word_key, user_id, attempts, result, created_at),
+        )
+
+def _increment_attempt(chat_id: int, user_id: int) -> None:
+    ATTEMPTS.setdefault(chat_id, {})
+    ATTEMPTS[chat_id][user_id] = ATTEMPTS[chat_id].get(user_id, 0) + 1
+
+async def _post_game_stats(
+    update: Update,
+    word_display: str,
+    winner_user_id: int,
+    winner_attempts: int,
+    previous_record: Optional[sqlite3.Row],
+    updated_record: Dict[str, Optional[int]],
+) -> None:
+    if not previous_record or previous_record["best_attempts"] is None:
+        return
+
+    is_new_record = winner_attempts < previous_record["best_attempts"]
+    word_label = word_display.upper()
+
+    with _db_connect() as conn:
+        winner_label = _get_user_label(conn, winner_user_id)
+        if is_new_record:
+            text = (
+                "🎉 Новый рекорд!\n"
+                f"{winner_label} угадал(а) слово «{word_label}» за {winner_attempts} попыток — быстрее всех!"
+            )
+            await update.message.reply_text(
+                escape_markdown(text, 2),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        best_user_id = updated_record.get("best_user_id")
+        worst_user_id = updated_record.get("worst_user_id")
+        best_attempts = updated_record.get("best_attempts")
+        worst_attempts = updated_record.get("worst_attempts")
+        total_games = updated_record.get("total_games")
+
+        if best_user_id is None or worst_user_id is None or best_attempts is None or worst_attempts is None:
+            return
+
+        champion = _get_user_label(conn, int(best_user_id))
+        outsider = _get_user_label(conn, int(worst_user_id))
+
+    text = "\n".join(
+        [
+            f"✅ Слово «{word_label}» угадано за {winner_attempts} попыток",
+            f"🏆 Чемпион: {champion} — {best_attempts} попыток",
+            f"🐌 Аутсайдер: {outsider} — {worst_attempts} попыток",
+            f"📊 Всего игр с этим словом: {total_games}",
+        ]
+    )
+    await update.message.reply_text(
+        escape_markdown(text, 2),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 # --- Команды ---
 
@@ -100,6 +315,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Заводим игру
     game = HangmanGame(chat_id=chat_id, secret=secret, host_user_id=user_id, max_attempts=6)
     GAMES[chat_id] = game
+    ATTEMPTS[chat_id] = {}
     del WAITING_WORD[user_id]
 
     # Сообщение в группу
@@ -172,6 +388,9 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     game = GAMES[chat_id]
+    user = update.effective_user
+    with _db_connect() as conn:
+        _upsert_user(conn, user)
     letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
     if len(letters) == 1 and len(guess_text) == 1:
         letter = letters[0]
@@ -182,22 +401,46 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
+        _increment_attempt(chat_id, user.id)
         is_correct, is_win, is_lose = game.guess(letter)
     else:
+        _increment_attempt(chat_id, user.id)
         is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
         is_lose = not is_win
         is_correct = is_win
 
     if is_win:
+        word_key = _normalize_phrase(game.secret)
+        participants = ATTEMPTS.get(chat_id, {})
+        winner_attempts = participants.get(user.id, 0)
+        with _db_connect() as conn:
+            previous_record = _fetch_word_record(conn, word_key)
+            _record_game_results(conn, chat_id, word_key, participants, user.id)
+            updated_record = _update_word_record(conn, word_key, user.id, winner_attempts, True)
+
         await msg.reply_text(
             f"{escape_markdown('🎉 Победа! Слово отгадано:', 2)}\n"
             f"`{game.secret}`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
+        await _post_game_stats(
+            update=update,
+            word_display=game.secret,
+            winner_user_id=user.id,
+            winner_attempts=winner_attempts,
+            previous_record=previous_record,
+            updated_record=updated_record,
+        )
         del GAMES[chat_id]
+        ATTEMPTS.pop(chat_id, None)
         return
 
     if is_lose:
+        word_key = _normalize_phrase(game.secret)
+        participants = ATTEMPTS.get(chat_id, {})
+        with _db_connect() as conn:
+            _record_game_results(conn, chat_id, word_key, participants, None)
+            _update_word_record(conn, word_key, None, None, False)
         await msg.reply_text(
             f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
             f"{escape_markdown('Секретное слово было:', 2)} `{game.secret}`\n"
@@ -205,6 +448,7 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         del GAMES[chat_id]
+        ATTEMPTS.pop(chat_id, None)
         return
 
     # Промежуточный прогресс
@@ -226,6 +470,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не найден в окружении. Создайте .env и задайте токен.")
 
+    _init_db()
     app: Application = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
