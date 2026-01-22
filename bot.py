@@ -25,6 +25,8 @@ log = logging.getLogger("hangman-bot")
 
 # Активные игры по chat_id
 GAMES: Dict[int, HangmanGame] = {}
+# Признак активной игры в чате
+ACTIVE_GAME: Dict[int, bool] = {}
 # Ожидание слова: user_id -> target_chat_id
 WAITING_WORD: Dict[int, int] = {}
 # Попытки пользователей в текущих играх: chat_id -> user_id -> attempts
@@ -295,6 +297,14 @@ def _sanitize_guess(s: str) -> str:
 def _normalize_phrase(s: str) -> str:
     return "".join(normalize_letter(ch) if is_letter(ch) else ch for ch in s)
 
+def _extract_single_letter(text: str) -> Optional[str]:
+    cleaned = text.strip()
+    if len(cleaned) != 1:
+        return None
+    if not is_letter(cleaned):
+        return None
+    return normalize_letter(cleaned)
+
 async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != ChatType.PRIVATE:
         return
@@ -315,6 +325,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Заводим игру
     game = HangmanGame(chat_id=chat_id, secret=secret, host_user_id=user_id, max_attempts=6)
     GAMES[chat_id] = game
+    ACTIVE_GAME[chat_id] = True
     ATTEMPTS[chat_id] = {}
     del WAITING_WORD[user_id]
 
@@ -352,13 +363,10 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     msg = update.message
     text = (msg.text or "").strip()
 
-    if not _mentioned_this_bot(update, context):
-        return
-
     chat_id = update.effective_chat.id
     bot_username = context.bot.username
-    # Ветка "загадать": упоминание бота + слово "загадать"
-    if re.search(r"\bзагадать\b", text, flags=re.IGNORECASE):
+    # Ветка старта: достаточно просто упомянуть бота
+    if _mentioned_this_bot(update, context) and not ACTIVE_GAME.get(chat_id):
         if chat_id in GAMES:
             await msg.reply_text(
                 f"{escape_markdown('Игра уже идёт. Текущий прогресс ниже.', 2)}\n{GAMES[chat_id].progress_message()}",
@@ -373,95 +381,119 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # Ветка угадывания буквы
-    if chat_id not in GAMES:
-        await msg.reply_text("Сначала начните игру: упомяните бота и напишите «загадать».")
-        return
+    # Ветка игры во время активной сессии
+    if ACTIVE_GAME.get(chat_id):
+        game = GAMES.get(chat_id)
+        if game is None:
+            ACTIVE_GAME.pop(chat_id, None)
+            return
+        mentioned = _mentioned_this_bot(update, context)
+        user = update.effective_user
+        with _db_connect() as conn:
+            _upsert_user(conn, user)
 
-    # Уберём все упоминания ботов, чтобы не мешали парсингу
-    cleaned = re.sub(r"@\w+", " ", text, flags=re.I)
-    guess_text = _sanitize_guess(cleaned)
-    if not guess_text:
-        await msg.reply_text(
-            "Отправьте одну букву или слово целиком (разрешены буквы, пробелы и дефисы)."
-        )
-        return
+        if mentioned:
+            # Уберём все упоминания ботов, чтобы не мешали парсингу
+            cleaned = re.sub(r"@\w+", " ", text, flags=re.I)
+            guess_text = _sanitize_guess(cleaned)
+            if not guess_text:
+                await msg.reply_text(
+                    "Отправьте одну букву или слово целиком (разрешены буквы, пробелы и дефисы)."
+                )
+                return
 
-    game = GAMES[chat_id]
-    user = update.effective_user
-    with _db_connect() as conn:
-        _upsert_user(conn, user)
-    letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
-    if len(letters) == 1 and len(guess_text) == 1:
-        letter = letters[0]
-        if game.already_tried(letter):
+            letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
+            if len(letters) == 1 and len(guess_text) == 1:
+                letter = letters[0]
+                if game.already_tried(letter):
+                    await msg.reply_text(
+                        f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    )
+                    return
+
+                _increment_attempt(chat_id, user.id)
+                is_correct, is_win, is_lose = game.guess(letter)
+            else:
+                _increment_attempt(chat_id, user.id)
+                is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
+                is_lose = not is_win
+                is_correct = is_win
+        else:
+            # Без упоминания принимаем только одну букву
+            letter = _extract_single_letter(text)
+            if not letter:
+                return
+            if game.already_tried(letter):
+                await msg.reply_text(
+                    f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
+
+            _increment_attempt(chat_id, user.id)
+            is_correct, is_win, is_lose = game.guess(letter)
+
+        if is_win:
+            word_key = _normalize_phrase(game.secret)
+            participants = ATTEMPTS.get(chat_id, {})
+            winner_attempts = participants.get(user.id, 0)
+            with _db_connect() as conn:
+                previous_record = _fetch_word_record(conn, word_key)
+                _record_game_results(conn, chat_id, word_key, participants, user.id)
+                updated_record = _update_word_record(conn, word_key, user.id, winner_attempts, True)
+
             await msg.reply_text(
-                f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
+                f"{escape_markdown('🎉 Победа! Слово отгадано:', 2)}\n"
+                f"`{game.secret}`",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
+            await _post_game_stats(
+                update=update,
+                word_display=game.secret,
+                winner_user_id=user.id,
+                winner_attempts=winner_attempts,
+                previous_record=previous_record,
+                updated_record=updated_record,
+            )
+            del GAMES[chat_id]
+            ACTIVE_GAME.pop(chat_id, None)
+            ATTEMPTS.pop(chat_id, None)
             return
 
-        _increment_attempt(chat_id, user.id)
-        is_correct, is_win, is_lose = game.guess(letter)
-    else:
-        _increment_attempt(chat_id, user.id)
-        is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
-        is_lose = not is_win
-        is_correct = is_win
+        if is_lose:
+            word_key = _normalize_phrase(game.secret)
+            participants = ATTEMPTS.get(chat_id, {})
+            with _db_connect() as conn:
+                _record_game_results(conn, chat_id, word_key, participants, None)
+                _update_word_record(conn, word_key, None, None, False)
+            await msg.reply_text(
+                f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
+                f"{escape_markdown('Секретное слово было:', 2)} `{game.secret}`\n"
+                f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            del GAMES[chat_id]
+            ACTIVE_GAME.pop(chat_id, None)
+            ATTEMPTS.pop(chat_id, None)
+            return
 
-    if is_win:
-        word_key = _normalize_phrase(game.secret)
-        participants = ATTEMPTS.get(chat_id, {})
-        winner_attempts = participants.get(user.id, 0)
-        with _db_connect() as conn:
-            previous_record = _fetch_word_record(conn, word_key)
-            _record_game_results(conn, chat_id, word_key, participants, user.id)
-            updated_record = _update_word_record(conn, word_key, user.id, winner_attempts, True)
-
-        await msg.reply_text(
-            f"{escape_markdown('🎉 Победа! Слово отгадано:', 2)}\n"
-            f"`{game.secret}`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        await _post_game_stats(
-            update=update,
-            word_display=game.secret,
-            winner_user_id=user.id,
-            winner_attempts=winner_attempts,
-            previous_record=previous_record,
-            updated_record=updated_record,
-        )
-        del GAMES[chat_id]
-        ATTEMPTS.pop(chat_id, None)
+        # Промежуточный прогресс
+        if is_correct:
+            await msg.reply_text(
+                f"{escape_markdown('Есть такая буква!', 2)}\n{game.progress_message()}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        else:
+            await msg.reply_text(
+                f"{escape_markdown('Мимо.', 2)}\n{game.progress_message()}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
         return
 
-    if is_lose:
-        word_key = _normalize_phrase(game.secret)
-        participants = ATTEMPTS.get(chat_id, {})
-        with _db_connect() as conn:
-            _record_game_results(conn, chat_id, word_key, participants, None)
-            _update_word_record(conn, word_key, None, None, False)
-        await msg.reply_text(
-            f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
-            f"{escape_markdown('Секретное слово было:', 2)} `{game.secret}`\n"
-            f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        del GAMES[chat_id]
-        ATTEMPTS.pop(chat_id, None)
+    if _mentioned_this_bot(update, context):
+        await msg.reply_text("Сначала начните игру: упомяните бота и напишите «загадать».")
         return
-
-    # Промежуточный прогресс
-    if is_correct:
-        await msg.reply_text(
-            f"{escape_markdown('Есть такая буква!', 2)}\n{game.progress_message()}",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-    else:
-        await msg.reply_text(
-            f"{escape_markdown('Мимо.', 2)}\n{game.progress_message()}",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
 
 # --- Запуск ---
 
