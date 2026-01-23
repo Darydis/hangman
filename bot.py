@@ -1,14 +1,31 @@
 from __future__ import annotations
 
+import inspect
+from collections import namedtuple
+
+# Compatibility shim for pymorphy2 on Python 3.11+
+if not hasattr(inspect, "getargspec"):
+    ArgSpec = namedtuple("ArgSpec", "args varargs keywords defaults")
+
+    def _getargspec(func):  # type: ignore[override]
+        spec = inspect.getfullargspec(func)
+        return ArgSpec(spec.args, spec.varargs, spec.varkw, spec.defaults)
+
+    inspect.getargspec = _getargspec  # type: ignore[attr-defined]
+
 import logging
 import os
+import random
 import re
 import sqlite3
-from datetime import datetime, timezone
-from typing import Dict, Optional
+import uuid
+from datetime import datetime, time, timedelta, timezone
+from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
-from telegram import Update, MessageEntity
+from telegram import Update, MessageEntity, BotCommand, KeyboardButton, ReplyKeyboardMarkup
+from wordfreq import top_n_list
+import pymorphy2
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.helpers import escape_markdown
@@ -29,6 +46,134 @@ GAMES: Dict[int, HangmanGame] = {}
 ACTIVE_GAME: Dict[int, bool] = {}
 # Ожидание слова: user_id -> target_chat_id
 WAITING_WORD: Dict[int, int] = {}
+# Ожидание слова для ссылки: user_id -> True
+WAITING_SHARED_WORD: Dict[int, bool] = {}
+# Секреты для расшаренных ссылок: token -> secret
+SHARED_WORDS: Dict[str, str] = {}
+# Отгаданные расшаренные слова: token -> set(user_id)
+SHARED_PLAYED: Dict[str, Set[int]] = {}
+# Активная игра из расшаренной ссылки: chat_id -> token
+GAME_SHARED_TOKEN: Dict[int, str] = {}
+# Активная игра по слову дня: chat_id -> date_key
+GAME_DAILY_DATE: Dict[int, str] = {}
+
+FALLBACK_WORDS = [
+    "абрикос",
+    "автобус",
+    "айсберг",
+    "аквариум",
+    "алмаз",
+    "апельсин",
+    "арбуз",
+    "барабан",
+    "билет",
+    "бинокль",
+    "блокнот",
+    "букет",
+    "вагон",
+    "вертолёт",
+    "вишня",
+    "гитара",
+    "глобус",
+    "гриб",
+    "дворец",
+    "дневник",
+    "дракон",
+    "жираф",
+    "журнал",
+    "замок",
+    "зонтик",
+    "кабинет",
+    "кактус",
+    "карандаш",
+    "карман",
+    "карусель",
+    "кафе",
+    "кедр",
+    "кит",
+    "клавиша",
+    "книга",
+    "кнопка",
+    "корабль",
+    "космос",
+    "котёл",
+    "кровать",
+    "крыльцо",
+    "кукла",
+    "лампа",
+    "лес",
+    "листва",
+    "лифт",
+    "медаль",
+    "метеор",
+    "молоко",
+    "мост",
+    "музей",
+    "ножницы",
+    "облако",
+    "огурец",
+    "окно",
+    "олень",
+    "пальто",
+    "пароход",
+    "паровоз",
+    "пейзаж",
+    "песок",
+    "письмо",
+    "планета",
+    "платье",
+    "плита",
+    "площадь",
+    "погода",
+    "помидор",
+    "потолок",
+    "праздник",
+    "пряник",
+    "путешествие",
+    "радио",
+    "радуга",
+    "ракушка",
+    "редис",
+    "рисунок",
+    "робот",
+    "ромашка",
+    "самолёт",
+    "сарай",
+    "свеча",
+    "сок",
+    "солнце",
+    "спорт",
+    "стекло",
+    "стул",
+    "сумка",
+    "суп",
+    "сцена",
+    "таблица",
+    "телефон",
+    "тетрадь",
+    "трамвай",
+    "труба",
+    "тюльпан",
+    "улитка",
+    "фонарь",
+    "хлеб",
+    "хомяк",
+    "холод",
+    "цветок",
+    "чайник",
+    "шар",
+    "шахматы",
+    "школа",
+    "шляпа",
+    "шоколад",
+    "щенок",
+    "яблоко",
+    "ягода",
+]
+
+PLAY_BUTTON_TEXT = "Play"
+NOUN_WORDS: List[str] = []
+MORPH = pymorphy2.MorphAnalyzer()
 # Попытки пользователей в текущих играх: chat_id -> user_id -> attempts
 ATTEMPTS: Dict[int, Dict[int, int]] = {}
 
@@ -75,6 +220,31 @@ def _init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_words (
+                day_key TEXT PRIMARY KEY,
+                word TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_plays (
+                day_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                PRIMARY KEY (day_key, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS play_history (
+                word TEXT PRIMARY KEY,
+                last_used_at TEXT NOT NULL
+            )
+            """
+        )
 
 def _upsert_user(conn: sqlite3.Connection, user) -> None:
     conn.execute(
@@ -108,6 +278,163 @@ def _fetch_word_record(conn: sqlite3.Connection, word_key: str) -> Optional[sqli
         """,
         (word_key,),
     ).fetchone()
+
+def _fetch_all_user_ids(conn: sqlite3.Connection) -> List[int]:
+    rows = conn.execute("SELECT user_id FROM users").fetchall()
+    return [int(row["user_id"]) for row in rows if row["user_id"] is not None]
+
+def _get_daily_word(conn: sqlite3.Connection, day_key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT word FROM daily_words WHERE day_key = ?",
+        (day_key,),
+    ).fetchone()
+    return row["word"] if row else None
+
+def _set_daily_word(conn: sqlite3.Connection, day_key: str, word_key: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO daily_words (day_key, word)
+        VALUES (?, ?)
+        ON CONFLICT(day_key) DO UPDATE SET word=excluded.word
+        """,
+        (day_key, word_key),
+    )
+
+def _fetch_daily_words(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute("SELECT word FROM daily_words").fetchall()
+    return [row["word"] for row in rows if row["word"]]
+
+def _fetch_known_words(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute("SELECT word FROM word_records").fetchall()
+    return [row["word"] for row in rows if row["word"]]
+
+def _fetch_user_guessed_words(conn: sqlite3.Connection, user_id: int) -> Set[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT word FROM games WHERE user_id = ? AND result = 'win'",
+        (user_id,),
+    ).fetchall()
+    return {row["word"] for row in rows if row["word"]}
+
+def _day_key_from_date(value: datetime) -> str:
+    return value.strftime("%Y%m%d")
+
+def _choose_daily_word(conn: sqlite3.Connection, day_key: str) -> str:
+    known_words = list(dict.fromkeys(_fetch_known_words(conn) + _fetch_daily_words(conn)))
+    pool = known_words if known_words else FALLBACK_WORDS
+    if not pool:
+        return "слово"
+    try:
+        day = datetime.strptime(day_key, "%Y%m%d")
+    except ValueError:
+        day = datetime.now(timezone.utc)
+    yesterday_key = _day_key_from_date(day - timedelta(days=1))
+    last_word = _get_daily_word(conn, yesterday_key)
+    candidates = [w for w in pool if w != last_word] or pool
+    return random.choice(candidates)
+
+def _choose_play_word(conn: sqlite3.Connection, user_id: int) -> Optional[str]:
+    global NOUN_WORDS
+    if not NOUN_WORDS:
+        # Берем частотные слова и фильтруем по существительным
+        candidates = top_n_list("ru", 5000)
+        nouns: List[str] = []
+        for word in candidates:
+            if not word or len(word) < 3:
+                continue
+            if not all(is_letter(ch) for ch in word):
+                continue
+            parse = MORPH.parse(word)
+            if parse and parse[0].tag.POS == "NOUN":
+                nouns.append(word.lower())
+        NOUN_WORDS = nouns or FALLBACK_WORDS
+
+    known_words = list(dict.fromkeys(_fetch_known_words(conn) + _fetch_daily_words(conn)))
+    pool = known_words if known_words else NOUN_WORDS
+    if not pool:
+        return None
+    history = _fetch_play_history(conn)
+    user_guessed = _fetch_user_guessed_words(conn, user_id)
+    unseen = [word for word in pool if word not in history and word not in user_guessed]
+    if unseen:
+        return random.choice(unseen)
+    available = [word for word in pool if word not in user_guessed]
+    if not available:
+        return None
+    sorted_by_age = sorted(
+        available,
+        key=lambda word: history.get(word, ""),
+    )
+    oldest_timestamp = history.get(sorted_by_age[0], "")
+    oldest_candidates = [word for word in sorted_by_age if history.get(word, "") == oldest_timestamp]
+    return random.choice(oldest_candidates) if oldest_candidates else random.choice(available)
+
+def _has_daily_play(conn: sqlite3.Connection, day_key: str, user_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM daily_plays WHERE day_key = ? AND user_id = ?",
+        (day_key, user_id),
+    ).fetchone()
+    return row is not None
+
+def _record_daily_play(conn: sqlite3.Connection, day_key: str, user_id: int) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO daily_plays (day_key, user_id)
+        VALUES (?, ?)
+        """,
+        (day_key, user_id),
+    )
+
+def _fetch_play_history(conn: sqlite3.Connection) -> Dict[str, str]:
+    rows = conn.execute("SELECT word, last_used_at FROM play_history").fetchall()
+    return {row["word"]: row["last_used_at"] for row in rows if row["word"] and row["last_used_at"]}
+
+def _record_play_word(conn: sqlite3.Connection, word: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO play_history (word, last_used_at)
+        VALUES (?, ?)
+        ON CONFLICT(word) DO UPDATE SET last_used_at=excluded.last_used_at
+        """,
+        (word, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+    )
+
+def _today_key() -> str:
+    return _day_key_from_date(datetime.now(timezone.utc))
+
+def _play_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(PLAY_BUTTON_TEXT)]],
+        resize_keyboard=True,
+    )
+
+def _fetch_word_leaderboard(conn: sqlite3.Connection, word_key: str) -> List[Tuple[int, int]]:
+    rows = conn.execute(
+        """
+        SELECT user_id, MIN(attempts) AS best_attempts
+        FROM games
+        WHERE word = ? AND result = 'win'
+        GROUP BY user_id
+        """,
+        (word_key,),
+    ).fetchall()
+    return sorted(
+        [(int(row["user_id"]), int(row["best_attempts"])) for row in rows if row["best_attempts"] is not None],
+        key=lambda item: item[1],
+    )
+
+def _count_word_players(conn: sqlite3.Connection, word_key: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) AS cnt FROM games WHERE word = ?",
+        (word_key,),
+    ).fetchone()
+    return int(row["cnt"]) if row and row["cnt"] is not None else 0
+
+def _count_word_losers(conn: sqlite3.Connection, word_key: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) AS cnt FROM games WHERE word = ? AND result = 'lose'",
+        (word_key,),
+    ).fetchone()
+    return int(row["cnt"]) if row and row["cnt"] is not None else 0
 
 def _update_word_record(
     conn: sqlite3.Connection,
@@ -223,6 +550,8 @@ async def _post_game_stats(
         best_attempts = updated_record.get("best_attempts")
         worst_attempts = updated_record.get("worst_attempts")
         total_games = updated_record.get("total_games")
+        if total_games is None or total_games <= 1:
+            return
 
         if best_user_id is None or worst_user_id is None or best_attempts is None or worst_attempts is None:
             return
@@ -243,16 +572,46 @@ async def _post_game_stats(
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
+async def _send_daily_word(context: ContextTypes.DEFAULT_TYPE) -> None:
+    day_key = _today_key()
+    with _db_connect() as conn:
+        word_key = _get_daily_word(conn, day_key)
+        if not word_key:
+            word_key = _choose_daily_word(conn, day_key)
+            _set_daily_word(conn, day_key, word_key)
+        user_ids = _fetch_all_user_ids(conn)
+
+    bot_username = context.bot.username
+    deep_link = f"https://t.me/{bot_username}?start=day_{day_key}"
+    text = "\n".join(
+        [
+            "🍀 Слово дня!",
+            "Нажмите, чтобы начать игру в личке с ботом:",
+            deep_link,
+        ]
+    )
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            log.warning("Не удалось отправить слово дня пользователю %s: %s", user_id, exc)
+
 # --- Команды ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     user = update.effective_user
+    with _db_connect() as conn:
+        _upsert_user(conn, user)
     if args and len(args) >= 1 and args[0].startswith("ask_"):
         try:
             chat_id = int(args[0].split("ask_", 1)[1])
         except ValueError:
-            await update.message.reply_text("Некорректная ссылка. Попробуйте ещё раз из группы, упомянув бота и слово «загадать».")
+            await update.message.reply_text("Некорректная ссылка. Попробуйте ещё раз из группы, просто упомянув бота.")
             return
         WAITING_WORD[user.id] = chat_id
         await update.message.reply_text(
@@ -260,18 +619,169 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Я не покажу его в группе — только маску."
         )
         return
+    if args and len(args) >= 1 and args[0].startswith("play_"):
+        token = args[0].split("play_", 1)[1]
+        secret = SHARED_WORDS.get(token)
+        if not secret:
+            await update.message.reply_text("Ссылка не найдена или устарела.")
+            return
+        chat_id = update.effective_chat.id
+        if user.id in SHARED_PLAYED.get(token, set()):
+            await update.message.reply_text("✅ Вы уже отгадали это слово по этой ссылке.")
+            return
+        if ACTIVE_GAME.get(chat_id):
+            await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
+            return
+        _start_game(chat_id=chat_id, secret=secret, host_user_id=user.id)
+        GAME_SHARED_TOKEN[chat_id] = token
+        await update.message.reply_text(
+            f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+    if args and len(args) >= 1 and args[0].startswith("day_"):
+        day_key = args[0].split("day_", 1)[1]
+        chat_id = update.effective_chat.id
+        with _db_connect() as conn:
+            word_key = _get_daily_word(conn, day_key)
+            if not word_key:
+                await update.message.reply_text("Слово дня недоступно.")
+                return
+            if _has_daily_play(conn, day_key, user.id):
+                await update.message.reply_text("✅ Вы уже отгадали слово дня.")
+                return
+        if ACTIVE_GAME.get(chat_id):
+            await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
+            return
+        _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
+        GAME_DAILY_DATE[chat_id] = day_key
+        await update.message.reply_text(
+            f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
 
     await update.message.reply_text(
-        "Привет! Чтобы начать игру в группе, напишите в том чате: «@<бот> загадать». "
-        "Я пришлю ссылку сюда для ввода секретного слова."
+        "Привет! Как начать игру:\n"
+        "A) В чате: упомяните бота в группе/чате — я пришлю сюда ссылку для ввода слова.\n"
+        "B) В боте: отправьте /share или «загадать», затем слово — я дам ссылку, "
+        "которую можно отправить любому человеку или в чат.\n"
+        "C) Играть с ботом: /play или кнопка Play.\n"
+        "D) Слово дня: /daily.\n"
+        "E) Статистика по слову: /stats <слово>.",
+        reply_markup=_play_keyboard(),
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Как играть:\n"
-        "1) В группе напишите «@бот загадать».\n"
-        "2) В личке введите слово.\n"
-        "3) В группе угадывайте буквы или слово целиком, упоминая бота."
+        "1) Если вы в - группе упомяните бота.\n"
+        "2) Если вы в боте - просто введите слово.\n"
+        "3) В группе угадывайте буквы (или слово целиком, упоминая бота).\n"
+        "4) В личке можно создать ссылку на игру: /share или «загадать».\n"
+        "5) Играть с ботом: /play или кнопка Play.\n"
+        "6) Глобальная статистика по слову: /stats <слово>."
+    )
+
+async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Команда доступна только в личных сообщениях с ботом.")
+        return
+    with _db_connect() as conn:
+        _upsert_user(conn, update.effective_user)
+    WAITING_SHARED_WORD[update.effective_user.id] = True
+    await update.message.reply_text(
+        "Введите секретное слово для ссылки (буквы рус/лат, можно пробелы и дефисы)."
+    )
+
+async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Команда доступна только в личных сообщениях с ботом.")
+        return
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    with _db_connect() as conn:
+        _upsert_user(conn, user)
+        word_key = _choose_play_word(conn, user.id)
+        if not word_key:
+            await update.message.reply_text("Вы уже угадывали все доступные слова. Скоро добавим новые.")
+            return
+        _record_play_word(conn, word_key)
+    if ACTIVE_GAME.get(chat_id):
+        await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
+        return
+    _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
+    await update.message.reply_text(
+        f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_bot_game(update, context)
+
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Команда доступна только в личных сообщениях с ботом.")
+        return
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    with _db_connect() as conn:
+        _upsert_user(conn, user)
+        day_key = _today_key()
+        word_key = _get_daily_word(conn, day_key)
+        if not word_key:
+            word_key = _choose_daily_word(conn, day_key)
+            _set_daily_word(conn, day_key, word_key)
+        if _has_daily_play(conn, day_key, user.id):
+            await update.message.reply_text("✅ Вы уже отгадали слово дня.")
+            return
+    if ACTIVE_GAME.get(chat_id):
+        await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
+        return
+    _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
+    GAME_DAILY_DATE[chat_id] = day_key
+    await update.message.reply_text(
+        f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /stats <слово>")
+        return
+    with _db_connect() as conn:
+        _upsert_user(conn, update.effective_user)
+    raw_word = " ".join(args).strip()
+    word = _sanitize_secret(raw_word)
+    if not word:
+        await update.message.reply_text("Нужно ввести слово (разрешены буквы, пробелы и дефисы).")
+        return
+
+    word_key = _normalize_phrase(word)
+    with _db_connect() as conn:
+        record = _fetch_word_record(conn, word_key)
+        if record is None:
+            await update.message.reply_text("Статистика по этому слову ещё не собиралась.")
+            return
+        best_attempts = record["best_attempts"]
+        best_user_id = record["best_user_id"]
+        total_games = record["total_games"]
+        total_players = _count_word_players(conn, word_key)
+        total_losers = _count_word_losers(conn, word_key)
+        best_label = _get_user_label(conn, int(best_user_id)) if best_user_id is not None else "—"
+
+    text = "\n".join(
+        [
+            f"Статистика по слову «{word}»:",
+            f"🏆 Рекорд: {best_attempts} ({best_label})" if best_attempts is not None else "🏆 Рекорд: —",
+            f"💀 Не справились: {total_losers}",
+            f"👥 Игроков: {total_players}",
+        ]
+    )
+    await update.message.reply_text(
+        escape_markdown(text, 2),
+        parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 # --- Обработка приватного ввода слова ---
@@ -297,6 +807,16 @@ def _sanitize_guess(s: str) -> str:
 def _normalize_phrase(s: str) -> str:
     return "".join(normalize_letter(ch) if is_letter(ch) else ch for ch in s)
 
+def _format_attempts(count: int) -> str:
+    if 11 <= count % 100 <= 14:
+        return "попыток"
+    last = count % 10
+    if last == 1:
+        return "попытку"
+    if 2 <= last <= 4:
+        return "попытки"
+    return "попыток"
+
 def _extract_single_letter(text: str) -> Optional[str]:
     cleaned = text.strip()
     if len(cleaned) != 1:
@@ -305,15 +825,177 @@ def _extract_single_letter(text: str) -> Optional[str]:
         return None
     return normalize_letter(cleaned)
 
+def _start_game(chat_id: int, secret: str, host_user_id: int) -> HangmanGame:
+    game = HangmanGame(chat_id=chat_id, secret=secret, host_user_id=host_user_id, max_attempts=6)
+    GAMES[chat_id] = game
+    ACTIVE_GAME[chat_id] = True
+    ATTEMPTS[chat_id] = {}
+    return game
+
+async def _process_guess(update: Update, chat_id: int, user, guess_text: str) -> None:
+    game = GAMES.get(chat_id)
+    if game is None:
+        ACTIVE_GAME.pop(chat_id, None)
+        return
+
+    letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
+    if len(letters) == 1 and len(guess_text) == 1:
+        letter = letters[0]
+        if game.already_tried(letter):
+            await update.message.reply_text(
+                f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        _increment_attempt(chat_id, user.id)
+        is_correct, is_win, is_lose = game.guess(letter)
+    else:
+        _increment_attempt(chat_id, user.id)
+        is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
+        is_lose = not is_win
+        is_correct = is_win
+
+    if is_win:
+        shared_token = GAME_SHARED_TOKEN.get(chat_id)
+        if shared_token:
+            SHARED_PLAYED.setdefault(shared_token, set()).add(user.id)
+        daily_key = GAME_DAILY_DATE.get(chat_id)
+        if daily_key:
+            with _db_connect() as conn:
+                _record_daily_play(conn, daily_key, user.id)
+        word_key = _normalize_phrase(game.secret)
+        participants = ATTEMPTS.get(chat_id, {})
+        winner_attempts = participants.get(user.id, 0)
+        with _db_connect() as conn:
+            previous_record = _fetch_word_record(conn, word_key)
+            _record_game_results(conn, chat_id, word_key, participants, user.id)
+            updated_record = _update_word_record(conn, word_key, user.id, winner_attempts, True)
+            leaderboard = _fetch_word_leaderboard(conn, word_key)
+            total_players = len(leaderboard)
+            record_line = ""
+            place_line = ""
+            if previous_record and previous_record["best_attempts"] is not None and previous_record["best_user_id"] is not None:
+                record_label = _get_user_label(conn, int(previous_record["best_user_id"]))
+                record_line = f"🏆 Рекорд: {previous_record['best_attempts']} ({record_label})"
+            if total_players > 1:
+                place = next(
+                    (idx + 1 for idx, (uid, _) in enumerate(leaderboard) if uid == user.id),
+                    total_players,
+                )
+                place_line = f"Вы на {place} месте из {total_players}"
+
+        lines = [f"🎉 Вы угадали слово «{game.secret}» за {winner_attempts} {_format_attempts(winner_attempts)}"]
+        if record_line:
+            lines.append(record_line)
+        if place_line:
+            lines.append(place_line)
+        await update.message.reply_text(
+            escape_markdown("\n".join(lines), 2),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        if not daily_key:
+            await _post_game_stats(
+                update=update,
+                word_display=game.secret,
+                winner_user_id=user.id,
+                winner_attempts=winner_attempts,
+                previous_record=previous_record,
+                updated_record=updated_record,
+            )
+        del GAMES[chat_id]
+        ACTIVE_GAME.pop(chat_id, None)
+        ATTEMPTS.pop(chat_id, None)
+        GAME_SHARED_TOKEN.pop(chat_id, None)
+        GAME_DAILY_DATE.pop(chat_id, None)
+        return
+
+    if is_lose:
+        word_key = _normalize_phrase(game.secret)
+        participants = ATTEMPTS.get(chat_id, {})
+        with _db_connect() as conn:
+            _record_game_results(conn, chat_id, word_key, participants, None)
+            _update_word_record(conn, word_key, None, None, False)
+        await update.message.reply_text(
+            f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
+            f"{escape_markdown('Секретное слово было:', 2)} `{game.secret}`\n"
+            f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        del GAMES[chat_id]
+        ACTIVE_GAME.pop(chat_id, None)
+        ATTEMPTS.pop(chat_id, None)
+        GAME_SHARED_TOKEN.pop(chat_id, None)
+        GAME_DAILY_DATE.pop(chat_id, None)
+        return
+
+    # Промежуточный прогресс
+    if is_correct:
+        await update.message.reply_text(
+            f"{escape_markdown('Есть такая буква!', 2)}\n{game.progress_message()}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    else:
+        await update.message.reply_text(
+            f"{escape_markdown('Мимо.', 2)}\n{game.progress_message()}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
 async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    bot_username = context.bot.username
     text = (update.message.text or "").strip()
     if not text:
         return
     if user_id not in WAITING_WORD:
-        await update.message.reply_text("Чтобы загадать слово в группе, сначала напишите в группе «@бот загадать».")
+        if text.strip().lower() == PLAY_BUTTON_TEXT.lower():
+            await _start_bot_game(update, context)
+            return
+        if user_id in WAITING_SHARED_WORD:
+            secret = _sanitize_secret(text)
+            if not secret:
+                await update.message.reply_text(
+                    "Нужно ввести хотя бы одну букву (разрешены буквы, пробелы и дефисы). Попробуйте снова."
+                )
+                return
+            token = uuid.uuid4().hex
+            SHARED_WORDS[token] = secret
+            del WAITING_SHARED_WORD[user_id]
+            deep_link = f"https://t.me/{bot_username}?start=play_{token}"
+            await update.message.reply_text(
+                "Готово! Отправьте эту ссылку любому человеку или в чат, "
+                "и игра начнётся у него в личке с ботом:\n"
+                f"{deep_link}"
+            )
+            return
+
+        if ACTIVE_GAME.get(chat_id):
+            guess_text = _sanitize_guess(text)
+            if not guess_text:
+                await update.message.reply_text(
+                    "Отправьте одну букву или слово целиком (разрешены буквы, пробелы и дефисы)."
+                )
+                return
+            user = update.effective_user
+            with _db_connect() as conn:
+                _upsert_user(conn, user)
+            await _process_guess(update, chat_id, user, guess_text)
+            return
+
+        if re.fullmatch(r"(?:/share|загадать)", text, flags=re.IGNORECASE):
+            WAITING_SHARED_WORD[user_id] = True
+            await update.message.reply_text(
+                "Введите секретное слово для ссылки (буквы рус/лат, можно пробелы и дефисы)."
+            )
+            return
+
+        await update.message.reply_text(
+            "Чтобы загадать слово в группе, просто упомяните бота в группе.\n"
+            "Чтобы создать ссылку на игру в личке — отправьте «загадать» или /share."
+        )
         return
 
     chat_id = WAITING_WORD[user_id]
@@ -323,10 +1005,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # Заводим игру
-    game = HangmanGame(chat_id=chat_id, secret=secret, host_user_id=user_id, max_attempts=6)
-    GAMES[chat_id] = game
-    ACTIVE_GAME[chat_id] = True
-    ATTEMPTS[chat_id] = {}
+    game = _start_game(chat_id=chat_id, secret=secret, host_user_id=user_id)
     del WAITING_WORD[user_id]
 
     # Сообщение в группу
@@ -401,98 +1080,18 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     "Отправьте одну букву или слово целиком (разрешены буквы, пробелы и дефисы)."
                 )
                 return
-
-            letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
-            if len(letters) == 1 and len(guess_text) == 1:
-                letter = letters[0]
-                if game.already_tried(letter):
-                    await msg.reply_text(
-                        f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                    )
-                    return
-
-                _increment_attempt(chat_id, user.id)
-                is_correct, is_win, is_lose = game.guess(letter)
-            else:
-                _increment_attempt(chat_id, user.id)
-                is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
-                is_lose = not is_win
-                is_correct = is_win
-        else:
-            # Без упоминания принимаем только одну букву
-            letter = _extract_single_letter(text)
-            if not letter:
-                return
-            if game.already_tried(letter):
-                await msg.reply_text(
-                    f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                )
-                return
-
-            _increment_attempt(chat_id, user.id)
-            is_correct, is_win, is_lose = game.guess(letter)
-
-        if is_win:
-            word_key = _normalize_phrase(game.secret)
-            participants = ATTEMPTS.get(chat_id, {})
-            winner_attempts = participants.get(user.id, 0)
-            with _db_connect() as conn:
-                previous_record = _fetch_word_record(conn, word_key)
-                _record_game_results(conn, chat_id, word_key, participants, user.id)
-                updated_record = _update_word_record(conn, word_key, user.id, winner_attempts, True)
-
-            await msg.reply_text(
-                f"{escape_markdown('🎉 Победа! Слово отгадано:', 2)}\n"
-                f"`{game.secret}`",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            await _post_game_stats(
-                update=update,
-                word_display=game.secret,
-                winner_user_id=user.id,
-                winner_attempts=winner_attempts,
-                previous_record=previous_record,
-                updated_record=updated_record,
-            )
-            del GAMES[chat_id]
-            ACTIVE_GAME.pop(chat_id, None)
-            ATTEMPTS.pop(chat_id, None)
+            await _process_guess(update, chat_id, user, guess_text)
             return
 
-        if is_lose:
-            word_key = _normalize_phrase(game.secret)
-            participants = ATTEMPTS.get(chat_id, {})
-            with _db_connect() as conn:
-                _record_game_results(conn, chat_id, word_key, participants, None)
-                _update_word_record(conn, word_key, None, None, False)
-            await msg.reply_text(
-                f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
-                f"{escape_markdown('Секретное слово было:', 2)} `{game.secret}`\n"
-                f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            del GAMES[chat_id]
-            ACTIVE_GAME.pop(chat_id, None)
-            ATTEMPTS.pop(chat_id, None)
+        # Без упоминания принимаем только одну букву
+        letter = _extract_single_letter(text)
+        if not letter:
             return
-
-        # Промежуточный прогресс
-        if is_correct:
-            await msg.reply_text(
-                f"{escape_markdown('Есть такая буква!', 2)}\n{game.progress_message()}",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-        else:
-            await msg.reply_text(
-                f"{escape_markdown('Мимо.', 2)}\n{game.progress_message()}",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+        await _process_guess(update, chat_id, user, letter)
         return
 
     if _mentioned_this_bot(update, context):
-        await msg.reply_text("Сначала начните игру: упомяните бота и напишите «загадать».")
+        await msg.reply_text("Сначала начните игру: просто упомяните бота.")
         return
 
 # --- Запуск ---
@@ -505,14 +1104,41 @@ def main() -> None:
     _init_db()
     app: Application = ApplicationBuilder().token(token).build()
 
+    async def _post_init(application: Application) -> None:
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", "Памятка и быстрый старт"),
+                BotCommand("help", "Как играть"),
+                BotCommand("play", "Играть с ботом"),
+                BotCommand("share", "Создать ссылку на игру"),
+                BotCommand("daily", "Слово дня"),
+                BotCommand("stats", "Глобальная статистика по слову"),
+            ]
+        )
+
+    app.post_init = _post_init
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("play", cmd_play))
+    app.add_handler(CommandHandler("share", cmd_share))
+    app.add_handler(CommandHandler("daily", cmd_daily))
+    app.add_handler(CommandHandler("stats", cmd_stats))
 
     # Приватные сообщения — ввод секретного слова
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, on_private_text))
 
     # Группы — любые тексты, но мы внутри проверим упоминание и логику
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, on_group_mention))
+
+    # Слово дня
+    if app.job_queue is None:
+        log.warning("JobQueue не доступен. Установите 'python-telegram-bot[job-queue]' для ежедневной рассылки.")
+    else:
+        app.job_queue.run_daily(
+            _send_daily_word,
+            time=time(hour=9, minute=0, tzinfo=timezone.utc),
+        )
 
     log.info("Starting bot...")
     app.run_polling(close_loop=False)
