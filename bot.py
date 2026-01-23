@@ -245,6 +245,14 @@ def _init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS play_user_last (
+                user_id INTEGER PRIMARY KEY,
+                last_word TEXT NOT NULL
+            )
+            """
+        )
 
 def _upsert_user(conn: sqlite3.Connection, user) -> None:
     conn.execute(
@@ -313,14 +321,15 @@ def _fetch_user_guessed_words(conn: sqlite3.Connection, user_id: int) -> Set[str
         "SELECT DISTINCT word FROM games WHERE user_id = ? AND result = 'win'",
         (user_id,),
     ).fetchall()
-    return {row["word"] for row in rows if row["word"]}
+    return {_normalize_game_word(row["word"]) for row in rows if row["word"]}
 
 def _day_key_from_date(value: datetime) -> str:
     return value.strftime("%Y%m%d")
 
 def _choose_daily_word(conn: sqlite3.Connection, day_key: str) -> str:
-    known_words = list(dict.fromkeys(_fetch_known_words(conn) + _fetch_daily_words(conn)))
-    pool = known_words if known_words else FALLBACK_WORDS
+    raw_words = _fetch_known_words(conn) + _fetch_daily_words(conn)
+    known_words = list(dict.fromkeys(_normalize_game_word(word) for word in raw_words if word))
+    pool = known_words if known_words else [_normalize_game_word(word) for word in FALLBACK_WORDS]
     if not pool:
         return "слово"
     try:
@@ -345,28 +354,45 @@ def _choose_play_word(conn: sqlite3.Connection, user_id: int) -> Optional[str]:
                 continue
             parse = MORPH.parse(word)
             if parse and parse[0].tag.POS == "NOUN":
-                nouns.append(word.lower())
-        NOUN_WORDS = nouns or FALLBACK_WORDS
+                nouns.append(_normalize_game_word(word))
+        NOUN_WORDS = nouns or [_normalize_game_word(word) for word in FALLBACK_WORDS]
 
-    known_words = list(dict.fromkeys(_fetch_known_words(conn) + _fetch_daily_words(conn)))
-    pool = known_words if known_words else NOUN_WORDS
-    if not pool:
+    raw_words = _fetch_known_words(conn) + _fetch_daily_words(conn)
+    known_words = list(dict.fromkeys(_normalize_game_word(word) for word in raw_words if word))
+    if not known_words and not NOUN_WORDS:
         return None
     history = _fetch_play_history(conn)
     user_guessed = _fetch_user_guessed_words(conn, user_id)
-    unseen = [word for word in pool if word not in history and word not in user_guessed]
-    if unseen:
-        return random.choice(unseen)
-    available = [word for word in pool if word not in user_guessed]
-    if not available:
-        return None
-    sorted_by_age = sorted(
-        available,
-        key=lambda word: history.get(word, ""),
+    last_word = _fetch_last_play_word(conn, user_id)
+
+    def _pick_from(pool: List[str], allow_last_word: bool) -> Optional[str]:
+        available = [word for word in pool if word not in user_guessed]
+        if not available:
+            return None
+        if last_word:
+            if len(available) == 1 and available[0] == last_word and not allow_last_word:
+                return None
+            if len(available) > 1:
+                available = [word for word in available if word != last_word] or available
+        unseen = [word for word in available if word not in history]
+        if unseen:
+            return random.choice(unseen)
+        sorted_by_age = sorted(
+            available,
+            key=lambda word: history.get(word, ""),
+        )
+        oldest_timestamp = history.get(sorted_by_age[0], "")
+        oldest_candidates = [word for word in sorted_by_age if history.get(word, "") == oldest_timestamp]
+        return random.choice(oldest_candidates) if oldest_candidates else random.choice(available)
+
+    # Приоритет: слова, которые уже загадывали другие игроки, затем словарь.
+    # Если оба пула закончились — разрешаем повтор последнего слова.
+    return (
+        _pick_from(known_words, allow_last_word=False)
+        or _pick_from(NOUN_WORDS, allow_last_word=False)
+        or _pick_from(known_words, allow_last_word=True)
+        or _pick_from(NOUN_WORDS, allow_last_word=True)
     )
-    oldest_timestamp = history.get(sorted_by_age[0], "")
-    oldest_candidates = [word for word in sorted_by_age if history.get(word, "") == oldest_timestamp]
-    return random.choice(oldest_candidates) if oldest_candidates else random.choice(available)
 
 def _has_daily_play(conn: sqlite3.Connection, day_key: str, user_id: int) -> bool:
     row = conn.execute(
@@ -395,7 +421,24 @@ def _record_play_word(conn: sqlite3.Connection, word: str) -> None:
         VALUES (?, ?)
         ON CONFLICT(word) DO UPDATE SET last_used_at=excluded.last_used_at
         """,
-        (word, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        (_normalize_game_word(word), datetime.now(timezone.utc).isoformat(timespec="seconds")),
+    )
+
+def _fetch_last_play_word(conn: sqlite3.Connection, user_id: int) -> Optional[str]:
+    row = conn.execute(
+        "SELECT last_word FROM play_user_last WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    return row["last_word"] if row else None
+
+def _record_last_play_word(conn: sqlite3.Connection, user_id: int, word: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO play_user_last (user_id, last_word)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET last_word=excluded.last_word
+        """,
+        (user_id, _normalize_game_word(word)),
     )
 
 def _today_key() -> str:
@@ -572,6 +615,36 @@ async def _post_game_stats(
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
+async def _post_word_stats(
+    update: Update,
+    word_display: str,
+    updated_record: Dict[str, Optional[int]],
+) -> None:
+    total_games = updated_record.get("total_games")
+    if total_games is None or total_games <= 0:
+        return
+
+    best_user_id = updated_record.get("best_user_id")
+    worst_user_id = updated_record.get("worst_user_id")
+    best_attempts = updated_record.get("best_attempts")
+    worst_attempts = updated_record.get("worst_attempts")
+
+    with _db_connect() as conn:
+        champion = _get_user_label(conn, int(best_user_id)) if best_user_id is not None else "—"
+        outsider = _get_user_label(conn, int(worst_user_id)) if worst_user_id is not None else "—"
+
+    word_label = word_display.upper()
+    lines = [f"📊 Статистика по слову «{word_label}»"]
+    if best_attempts is not None and best_user_id is not None:
+        lines.append(f"🏆 Чемпион: {champion} — {best_attempts} попыток")
+    if worst_attempts is not None and worst_user_id is not None:
+        lines.append(f"🐌 Аутсайдер: {outsider} — {worst_attempts} попыток")
+    lines.append(f"📊 Всего игр с этим словом: {total_games}")
+    await update.message.reply_text(
+        escape_markdown("\n".join(lines), 2),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
 async def _send_daily_word(context: ContextTypes.DEFAULT_TYPE) -> None:
     day_key = _today_key()
     with _db_connect() as conn:
@@ -647,6 +720,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not word_key:
                 await update.message.reply_text("Слово дня недоступно.")
                 return
+            word_key = _normalize_game_word(word_key)
             if _has_daily_play(conn, day_key, user.id):
                 await update.message.reply_text("✅ Вы уже отгадали слово дня.")
                 return
@@ -723,10 +797,12 @@ async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     with _db_connect() as conn:
         _upsert_user(conn, user)
         word_key = _choose_play_word(conn, user.id)
+        word_key = _normalize_game_word(word_key) if word_key else None
         if not word_key:
-            await update.message.reply_text("Вы уже угадывали все доступные слова. Скоро добавим новые.")
+            await update.message.reply_text("Сейчас нет доступных слов. Попробуйте позже.")
             return
         _record_play_word(conn, word_key)
+        _record_last_play_word(conn, user.id, word_key)
     if ACTIVE_GAME.get(chat_id):
         await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
         return
@@ -752,6 +828,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not word_key:
             word_key = _choose_daily_word(conn, day_key)
             _set_daily_word(conn, day_key, word_key)
+        word_key = _normalize_game_word(word_key)
         if _has_daily_play(conn, day_key, user.id):
             await update.message.reply_text("✅ Вы уже отгадали слово дня.")
             return
@@ -837,6 +914,24 @@ def _format_attempts(count: int) -> str:
         return "попытки"
     return "попыток"
 
+def _to_nominative_phrase(phrase: str) -> str:
+    tokens = re.split(r"(\s+|-)", phrase)
+    normalized: List[str] = []
+    for token in tokens:
+        if not token or token.isspace() or token == "-":
+            normalized.append(token)
+            continue
+        if all(is_letter(ch) for ch in token):
+            parsed = MORPH.parse(token)
+            noun = next((p for p in parsed if p.tag.POS == "NOUN"), None)
+            normalized.append(noun.normal_form if noun else parsed[0].normal_form)
+        else:
+            normalized.append(token)
+    return "".join(normalized)
+
+def _normalize_game_word(word: str) -> str:
+    return _normalize_phrase(_to_nominative_phrase(word))
+
 def _extract_single_letter(text: str) -> Optional[str]:
     cleaned = text.strip()
     if len(cleaned) != 1:
@@ -905,7 +1000,8 @@ async def _process_guess(update: Update, chat_id: int, user, guess_text: str) ->
                 )
                 place_line = f"Вы на {place} месте из {total_players}"
 
-        lines = [f"🎉 Вы угадали слово «{game.secret}» за {winner_attempts} {_format_attempts(winner_attempts)}"]
+        display_word = _to_nominative_phrase(game.secret)
+        lines = [f"🎉 Вы угадали слово «{display_word}» за {winner_attempts} {_format_attempts(winner_attempts)}"]
         if record_line:
             lines.append(record_line)
         if place_line:
@@ -913,6 +1009,10 @@ async def _process_guess(update: Update, chat_id: int, user, guess_text: str) ->
         await update.message.reply_text(
             escape_markdown("\n".join(lines), 2),
             parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        await update.message.reply_text(
+            "Сыграть еще раз?",
+            reply_markup=_play_keyboard(),
         )
         if not daily_key:
             await _post_game_stats(
@@ -935,12 +1035,22 @@ async def _process_guess(update: Update, chat_id: int, user, guess_text: str) ->
         participants = ATTEMPTS.get(chat_id, {})
         with _db_connect() as conn:
             _record_game_results(conn, chat_id, word_key, participants, None)
-            _update_word_record(conn, word_key, None, None, False)
+            updated_record = _update_word_record(conn, word_key, None, None, False)
+        display_word = _to_nominative_phrase(game.secret)
         await update.message.reply_text(
             f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
-            f"{escape_markdown('Секретное слово было:', 2)} `{game.secret}`\n"
+            f"{escape_markdown('Секретное слово было:', 2)} `{display_word}`\n"
             f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
             parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        await _post_word_stats(
+            update=update,
+            word_display=game.secret,
+            updated_record=updated_record,
+        )
+        await update.message.reply_text(
+            "Сыграть еще раз?",
+            reply_markup=_play_keyboard(),
         )
         del GAMES[chat_id]
         ACTIVE_GAME.pop(chat_id, None)
