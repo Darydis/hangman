@@ -23,11 +23,11 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
-from telegram import Update, MessageEntity, BotCommand, KeyboardButton, ReplyKeyboardMarkup
+from telegram import Update, MessageEntity, BotCommand, KeyboardButton, ReplyKeyboardMarkup, LabeledPrice
 from wordfreq import top_n_list
 import pymorphy2
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, PreCheckoutQueryHandler, filters
 from telegram.helpers import escape_markdown
 
 from hangman.core import HangmanGame, is_letter, normalize_letter, render_gallows
@@ -56,6 +56,16 @@ SHARED_PLAYED: Dict[str, Set[int]] = {}
 GAME_SHARED_TOKEN: Dict[int, str] = {}
 # Активная игра по слову дня: chat_id -> date_key
 GAME_DAILY_DATE: Dict[int, str] = {}
+# Ожидание оплаты дополнительной попытки: chat_id -> user_id
+EXTRA_PAYMENT_PENDING: Dict[int, int] = {}
+# Ожидание выбора после исчерпания попыток: chat_id -> user_id
+LOSE_CHOICE_PENDING: Dict[int, int] = {}
+
+EXTRA_ATTEMPT_PRICE = 5
+EXTRA_ATTEMPT_CURRENCY = "XTR"
+BUY_ATTEMPT_TEXT = "⭐ Купить попытку"
+END_GAME_TEXT = "❌ Завершить"
+NEW_GAME_TEXT = "🎮 Новая игра"
 
 FALLBACK_WORDS = [
     "абрикос",
@@ -449,6 +459,91 @@ def _play_keyboard() -> ReplyKeyboardMarkup:
         [[KeyboardButton(PLAY_BUTTON_TEXT)]],
         resize_keyboard=True,
     )
+
+def _lose_choice_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BUY_ATTEMPT_TEXT)],
+            [KeyboardButton(END_GAME_TEXT)],
+            [KeyboardButton(NEW_GAME_TEXT)],
+        ],
+        resize_keyboard=True,
+    )
+
+async def _prompt_lose_choice(update: Update) -> None:
+    await update.message.reply_text(
+        "Ты использовал(а) все попытки 😬\n\n"
+        "Хочешь продолжить игру?\n\n"
+        "⭐ +1 попытка — 5 Stars\n"
+        "❌ Завершить игру\n"
+        "🎮 Новая игра",
+        reply_markup=_lose_choice_keyboard(),
+    )
+
+async def _offer_extra_attempt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> bool:
+    if EXTRA_PAYMENT_PENDING.get(chat_id) == user_id:
+        await _prompt_lose_choice(update)
+        return True
+
+    provider_token = os.getenv("TELEGRAM_PROVIDER_TOKEN")
+    if provider_token is None:
+        await update.message.reply_text("Платежи не настроены. Попытки закончились.")
+        return False
+
+    payload = f"extra_attempt:{chat_id}:{user_id}"
+    prices = [LabeledPrice("Дополнительная попытка", EXTRA_ATTEMPT_PRICE)]
+    EXTRA_PAYMENT_PENDING[chat_id] = user_id
+    await context.bot.send_invoice(
+        chat_id=chat_id,
+        title="Дополнительная попытка",
+        description="Плюс 1 попытка в текущей игре",
+        payload=payload,
+        provider_token=provider_token,
+        currency=EXTRA_ATTEMPT_CURRENCY,
+        prices=prices,
+    )
+    return True
+
+async def _finalize_loss(
+    update: Update,
+    chat_id: int,
+    game: HangmanGame,
+) -> None:
+    word_key = _normalize_phrase(game.secret)
+    participants = ATTEMPTS.get(chat_id, {})
+    with _db_connect() as conn:
+        _record_game_results(conn, chat_id, word_key, participants, None)
+        updated_record = _update_word_record(conn, word_key, None, None, False)
+
+    display_word = _to_nominative_phrase(game.secret)
+    await update.message.reply_text(
+        f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
+        f"{escape_markdown('Секретное слово было:', 2)} `{display_word}`\n"
+        f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    await _post_word_stats(
+        update=update,
+        word_display=game.secret,
+        updated_record=updated_record,
+    )
+    await update.message.reply_text(
+        "Сыграть еще раз?",
+        reply_markup=_play_keyboard(),
+    )
+
+    del GAMES[chat_id]
+    ACTIVE_GAME.pop(chat_id, None)
+    ATTEMPTS.pop(chat_id, None)
+    GAME_SHARED_TOKEN.pop(chat_id, None)
+    GAME_DAILY_DATE.pop(chat_id, None)
+    EXTRA_PAYMENT_PENDING.pop(chat_id, None)
+    LOSE_CHOICE_PENDING.pop(chat_id, None)
 
 def _fetch_word_leaderboard(conn: sqlite3.Connection, word_key: str) -> List[Tuple[int, int]]:
     rows = conn.execute(
@@ -881,6 +976,37 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
+async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    if query.invoice_payload.startswith("extra_attempt:"):
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Некорректный платеж.")
+
+async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload
+    if not payload.startswith("extra_attempt:"):
+        return
+    _, chat_id_str, user_id_str = payload.split(":", 2)
+    chat_id = int(chat_id_str)
+    user_id = int(user_id_str)
+    if update.effective_chat.id != chat_id or update.effective_user.id != user_id:
+        return
+
+    game = GAMES.get(chat_id)
+    EXTRA_PAYMENT_PENDING.pop(chat_id, None)
+    LOSE_CHOICE_PENDING.pop(chat_id, None)
+    if not game:
+        await update.message.reply_text("Игра не найдена.")
+        return
+
+    game.max_attempts += 1
+    await update.message.reply_text(
+        f"{escape_markdown('✅ Добавлена 1 попытка. Продолжаем!', 2)}\n{game.progress_message()}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
 # --- Обработка приватного ввода слова ---
 
 def _sanitize_secret(s: str) -> str:
@@ -947,10 +1073,25 @@ def _start_game(chat_id: int, secret: str, host_user_id: int) -> HangmanGame:
     ATTEMPTS[chat_id] = {}
     return game
 
-async def _process_guess(update: Update, chat_id: int, user, guess_text: str) -> None:
+async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, guess_text: str) -> None:
     game = GAMES.get(chat_id)
     if game is None:
         ACTIVE_GAME.pop(chat_id, None)
+        return
+
+    if (
+        update.effective_chat.type == ChatType.PRIVATE
+        and game.is_lose()
+        and EXTRA_PAYMENT_PENDING.get(chat_id) == user.id
+    ):
+        await update.message.reply_text("Попытки закончились. Оплатите +1 попытку за 5⭐️.")
+        return
+
+    if (
+        update.effective_chat.type == ChatType.PRIVATE
+        and LOSE_CHOICE_PENDING.get(chat_id) == user.id
+    ):
+        await _prompt_lose_choice(update)
         return
 
     letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
@@ -1031,32 +1172,11 @@ async def _process_guess(update: Update, chat_id: int, user, guess_text: str) ->
         return
 
     if is_lose:
-        word_key = _normalize_phrase(game.secret)
-        participants = ATTEMPTS.get(chat_id, {})
-        with _db_connect() as conn:
-            _record_game_results(conn, chat_id, word_key, participants, None)
-            updated_record = _update_word_record(conn, word_key, None, None, False)
-        display_word = _to_nominative_phrase(game.secret)
-        await update.message.reply_text(
-            f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
-            f"{escape_markdown('Секретное слово было:', 2)} `{display_word}`\n"
-            f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        await _post_word_stats(
-            update=update,
-            word_display=game.secret,
-            updated_record=updated_record,
-        )
-        await update.message.reply_text(
-            "Сыграть еще раз?",
-            reply_markup=_play_keyboard(),
-        )
-        del GAMES[chat_id]
-        ACTIVE_GAME.pop(chat_id, None)
-        ATTEMPTS.pop(chat_id, None)
-        GAME_SHARED_TOKEN.pop(chat_id, None)
-        GAME_DAILY_DATE.pop(chat_id, None)
+        if update.effective_chat.type == ChatType.PRIVATE:
+            LOSE_CHOICE_PENDING[chat_id] = user.id
+            await _prompt_lose_choice(update)
+            return
+        await _finalize_loss(update, chat_id, game)
         return
 
     # Промежуточный прогресс
@@ -1081,6 +1201,24 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not text:
         return
     if user_id not in WAITING_WORD:
+        if LOSE_CHOICE_PENDING.get(chat_id) == user_id:
+            normalized = text.strip().lower()
+            if normalized == BUY_ATTEMPT_TEXT.lower():
+                await _offer_extra_attempt(update, context, chat_id, user_id)
+                return
+            if normalized == END_GAME_TEXT.lower():
+                game = GAMES.get(chat_id)
+                if game:
+                    await _finalize_loss(update, chat_id, game)
+                return
+            if normalized == NEW_GAME_TEXT.lower():
+                game = GAMES.get(chat_id)
+                if game:
+                    await _finalize_loss(update, chat_id, game)
+                await _start_bot_game(update, context)
+                return
+            await _prompt_lose_choice(update)
+            return
         if text.strip().lower() == PLAY_BUTTON_TEXT.lower():
             await _start_bot_game(update, context)
             return
@@ -1112,7 +1250,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             user = update.effective_user
             with _db_connect() as conn:
                 _upsert_user(conn, user)
-            await _process_guess(update, chat_id, user, guess_text)
+            await _process_guess(update, context, chat_id, user, guess_text)
             return
 
         if re.fullmatch(r"(?:/share|загадать)", text, flags=re.IGNORECASE):
@@ -1210,14 +1348,14 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     "Отправьте одну букву или слово целиком (разрешены буквы, пробелы и дефисы)."
                 )
                 return
-            await _process_guess(update, chat_id, user, guess_text)
+            await _process_guess(update, context, chat_id, user, guess_text)
             return
 
         # Без упоминания принимаем только одну букву
         letter = _extract_single_letter(text)
         if not letter:
             return
-        await _process_guess(update, chat_id, user, letter)
+        await _process_guess(update, context, chat_id, user, letter)
         return
 
     if _mentioned_this_bot(update, context):
@@ -1254,6 +1392,8 @@ def main() -> None:
     app.add_handler(CommandHandler("share", cmd_share))
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(PreCheckoutQueryHandler(on_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
 
     # Приватные сообщения — ввод секретного слова
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, on_private_text))
