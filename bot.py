@@ -23,11 +23,29 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
-from telegram import Update, MessageEntity, BotCommand, KeyboardButton, ReplyKeyboardMarkup, LabeledPrice
+from telegram import (
+    Update,
+    MessageEntity,
+    BotCommand,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+)
 from wordfreq import top_n_list
 import pymorphy2
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, PreCheckoutQueryHandler, filters
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    CallbackQueryHandler,
+    filters,
+)
 from telegram.helpers import escape_markdown
 
 from hangman.core import HangmanGame, is_letter, normalize_letter, render_gallows
@@ -50,6 +68,8 @@ WAITING_WORD: Dict[int, int] = {}
 WAITING_SHARED_WORD: Dict[int, bool] = {}
 # Секреты для расшаренных ссылок: token -> secret
 SHARED_WORDS: Dict[str, str] = {}
+# Автор расшаренного слова: token -> user_id
+SHARED_HOST: Dict[str, int] = {}
 # Отгаданные расшаренные слова: token -> set(user_id)
 SHARED_PLAYED: Dict[str, Set[int]] = {}
 # Активная игра из расшаренной ссылки: chat_id -> token
@@ -66,6 +86,9 @@ EXTRA_ATTEMPT_CURRENCY = "XTR"
 BUY_ATTEMPT_TEXT = "⭐ Купить попытку"
 END_GAME_TEXT = "❌ Завершить"
 NEW_GAME_TEXT = "🎮 Новая игра"
+BUY_ATTEMPT_CB = "buy_attempt"
+END_GAME_CB = "end_game"
+NEW_GAME_CB = "new_game"
 
 FALLBACK_WORDS = [
     "абрикос",
@@ -460,18 +483,17 @@ def _play_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
-def _lose_choice_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
+def _lose_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            [KeyboardButton(BUY_ATTEMPT_TEXT)],
-            [KeyboardButton(END_GAME_TEXT)],
-            [KeyboardButton(NEW_GAME_TEXT)],
-        ],
-        resize_keyboard=True,
+            [InlineKeyboardButton(BUY_ATTEMPT_TEXT, callback_data=BUY_ATTEMPT_CB)],
+            [InlineKeyboardButton(END_GAME_TEXT, callback_data=END_GAME_CB)],
+            [InlineKeyboardButton(NEW_GAME_TEXT, callback_data=NEW_GAME_CB)],
+        ]
     )
 
 async def _prompt_lose_choice(update: Update) -> None:
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "Ты использовал(а) все попытки 😬\n\n"
         "Хочешь продолжить игру?\n\n"
         "⭐ +1 попытка — 5 Stars\n"
@@ -521,7 +543,7 @@ async def _finalize_loss(
         updated_record = _update_word_record(conn, word_key, None, None, False)
 
     display_word = _to_nominative_phrase(game.secret)
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"{escape_markdown('💀 Поражение. Вы повешены.', 2)}\n"
         f"{escape_markdown('Секретное слово было:', 2)} `{display_word}`\n"
         f"```\n{render_gallows(game.max_attempts, game.max_attempts)}\n```",
@@ -532,7 +554,7 @@ async def _finalize_loss(
         word_display=game.secret,
         updated_record=updated_record,
     )
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "Сыграть еще раз?",
         reply_markup=_play_keyboard(),
     )
@@ -794,6 +816,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Ссылка не найдена или устарела.")
             return
         chat_id = update.effective_chat.id
+        if SHARED_HOST.get(token) == user.id:
+            await update.message.reply_text("Вы не можете отгадывать своё слово по этой ссылке.")
+            return
         if user.id in SHARED_PLAYED.get(token, set()):
             await update.message.reply_text("✅ Вы уже отгадали это слово по этой ссылке.")
             return
@@ -861,16 +886,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=_play_keyboard(),
     )
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Как играть:\n"
-        "1) Если вы в - группе упомяните бота.\n"
-        "2) Если вы в боте - просто введите слово.\n"
-        "3) В группе угадывайте буквы (или слово целиком, упоминая бота).\n"
-        "4) В личке можно создать ссылку на игру: /share или «загадать».\n"
-        "5) Играть с ботом: /play или кнопка Play.\n"
-        "6) Глобальная статистика по слову: /stats <слово>."
-    )
+
 
 async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -889,6 +905,10 @@ async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     user = update.effective_user
     chat_id = update.effective_chat.id
+    if LOSE_CHOICE_PENDING.get(chat_id) == user.id:
+        game = GAMES.get(chat_id)
+        if game:
+            await _finalize_loss(update, chat_id, game)
     with _db_connect() as conn:
         _upsert_user(conn, user)
         word_key = _choose_play_word(conn, user.id)
@@ -1007,6 +1027,33 @@ async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
+async def on_lose_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if LOSE_CHOICE_PENDING.get(chat_id) != user_id:
+        await query.message.reply_text("Игра уже завершена или не найдена.")
+        return
+
+    game = GAMES.get(chat_id)
+    if not game:
+        await query.message.reply_text("Игра не найдена.")
+        LOSE_CHOICE_PENDING.pop(chat_id, None)
+        return
+
+    if query.data == BUY_ATTEMPT_CB:
+        await _offer_extra_attempt(update, context, chat_id, user_id)
+        return
+    if query.data == END_GAME_CB:
+        await _finalize_loss(update, chat_id, game)
+        return
+    if query.data == NEW_GAME_CB:
+        await _finalize_loss(update, chat_id, game)
+        await _start_bot_game(update, context)
+        return
+
 # --- Обработка приватного ввода слова ---
 
 def _sanitize_secret(s: str) -> str:
@@ -1066,6 +1113,22 @@ def _extract_single_letter(text: str) -> Optional[str]:
         return None
     return normalize_letter(cleaned)
 
+def _letter_script(ch: str) -> Optional[str]:
+    if re.fullmatch(r"[A-Za-z]", ch):
+        return "latin"
+    if re.fullmatch(r"[А-Яа-яЁё]", ch):
+        return "cyrillic"
+    return None
+
+def _secret_script(secret: str) -> Optional[str]:
+    has_cyrillic = any(re.fullmatch(r"[А-Яа-яЁё]", ch) for ch in secret)
+    has_latin = any(re.fullmatch(r"[A-Za-z]", ch) for ch in secret)
+    if has_cyrillic and not has_latin:
+        return "cyrillic"
+    if has_latin and not has_cyrillic:
+        return "latin"
+    return None
+
 def _start_game(chat_id: int, secret: str, host_user_id: int) -> HangmanGame:
     game = HangmanGame(chat_id=chat_id, secret=secret, host_user_id=host_user_id, max_attempts=6)
     GAMES[chat_id] = game
@@ -1097,6 +1160,11 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     letters = [normalize_letter(ch) for ch in guess_text if is_letter(ch)]
     if len(letters) == 1 and len(guess_text) == 1:
         letter = letters[0]
+        secret_script = _secret_script(game.secret)
+        guessed_script = _letter_script(letter)
+        if secret_script and guessed_script and secret_script != guessed_script:
+            await update.message.reply_text("Неверная раскладка. Попытка не засчитана.")
+            return
         if game.already_tried(letter):
             await update.message.reply_text(
                 f"{escape_markdown(f'Буква «{letter}» уже называлась.', 2)}\n{game.progress_message()}",
@@ -1107,6 +1175,12 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         _increment_attempt(chat_id, user.id)
         is_correct, is_win, is_lose = game.guess(letter)
     else:
+        secret_script = _secret_script(game.secret)
+        if secret_script:
+            guessed_scripts = {_letter_script(ch) for ch in letters if _letter_script(ch)}
+            if guessed_scripts and guessed_scripts != {secret_script}:
+                await update.message.reply_text("Неверная раскладка. Попытка не засчитана.")
+                return
         _increment_attempt(chat_id, user.id)
         is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
         is_lose = not is_win
@@ -1231,6 +1305,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             token = uuid.uuid4().hex
             SHARED_WORDS[token] = secret
+            SHARED_HOST[token] = user_id
             del WAITING_SHARED_WORD[user_id]
             deep_link = f"https://t.me/{bot_username}?start=play_{token}"
             await update.message.reply_text(
@@ -1376,7 +1451,6 @@ def main() -> None:
         await application.bot.set_my_commands(
             [
                 BotCommand("start", "Памятка и быстрый старт"),
-                BotCommand("help", "Как играть"),
                 BotCommand("play", "Играть с ботом"),
                 BotCommand("share", "Создать ссылку на игру"),
                 BotCommand("daily", "Слово дня"),
@@ -1387,12 +1461,12 @@ def main() -> None:
     app.post_init = _post_init
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("play", cmd_play))
     app.add_handler(CommandHandler("share", cmd_share))
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(PreCheckoutQueryHandler(on_precheckout))
+    app.add_handler(CallbackQueryHandler(on_lose_choice_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
 
     # Приватные сообщения — ввод секретного слова
