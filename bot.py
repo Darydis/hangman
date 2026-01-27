@@ -502,13 +502,37 @@ async def _prompt_lose_choice(update: Update) -> None:
         reply_markup=_lose_choice_keyboard(),
     )
 
+def _buy_attempt_link(bot_username: str, chat_id: int) -> str:
+    return f"https://t.me/{bot_username}?start=buy_{chat_id}"
+
+async def _prompt_group_lose_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    bot_username = context.bot.username
+    buy_link = _buy_attempt_link(bot_username, chat_id)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(BUY_ATTEMPT_TEXT, url=buy_link)],
+            [InlineKeyboardButton(END_GAME_TEXT, callback_data=END_GAME_CB)],
+            [InlineKeyboardButton(NEW_GAME_TEXT, callback_data=NEW_GAME_CB)],
+        ]
+    )
+    await update.effective_message.reply_text(
+        "Ты использовал(а) все попытки 😬\n\n"
+        "Хочешь продолжить игру?\n\n"
+        "⭐ +1 попытка — 5 Stars\n"
+        "❌ Завершить игру\n"
+        "🎮 Новая игра",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
 async def _offer_extra_attempt(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
+    game_chat_id: int,
     user_id: int,
+    invoice_chat_id: Optional[int] = None,
 ) -> bool:
-    if EXTRA_PAYMENT_PENDING.get(chat_id) == user_id:
+    if EXTRA_PAYMENT_PENDING.get(game_chat_id) == user_id and invoice_chat_id is None:
         await _prompt_lose_choice(update)
         return True
 
@@ -517,18 +541,28 @@ async def _offer_extra_attempt(
         await update.message.reply_text("Платежи не настроены. Попытки закончились.")
         return False
 
-    payload = f"extra_attempt:{chat_id}:{user_id}"
+    payload = f"extra_attempt:{game_chat_id}:{user_id}"
     prices = [LabeledPrice("Дополнительная попытка", EXTRA_ATTEMPT_PRICE)]
-    EXTRA_PAYMENT_PENDING[chat_id] = user_id
-    await context.bot.send_invoice(
-        chat_id=chat_id,
-        title="Дополнительная попытка",
-        description="Плюс 1 попытка в текущей игре",
-        payload=payload,
-        provider_token=provider_token,
-        currency=EXTRA_ATTEMPT_CURRENCY,
-        prices=prices,
-    )
+    EXTRA_PAYMENT_PENDING[game_chat_id] = user_id
+    target_chat_id = invoice_chat_id or update.effective_chat.id
+    try:
+        await context.bot.send_invoice(
+            chat_id=target_chat_id,
+            title="Дополнительная попытка",
+            description="Плюс 1 попытка в текущей игре",
+            payload=payload,
+            provider_token=provider_token,
+            currency=EXTRA_ATTEMPT_CURRENCY,
+            prices=prices,
+        )
+    except Exception as exc:
+        EXTRA_PAYMENT_PENDING.pop(game_chat_id, None)
+        await update.effective_message.reply_text(
+            "Не удалось создать счет на оплату.\n"
+            "Проверьте, что Stars доступны для бота, и попробуйте еще раз."
+        )
+        log.exception("Не удалось создать счет Stars: %s", exc)
+        return False
     return True
 
 async def _finalize_loss(
@@ -757,7 +791,7 @@ async def _post_word_stats(
     if worst_attempts is not None and worst_user_id is not None:
         lines.append(f"🐌 Аутсайдер: {outsider} — {worst_attempts} попыток")
     lines.append(f"📊 Всего игр с этим словом: {total_games}")
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         escape_markdown("\n".join(lines), 2),
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -854,6 +888,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
+    if args and len(args) >= 1 and args[0] == "playbot":
+        await _start_bot_game(update, context)
+        return
+    if args and len(args) >= 1 and args[0].startswith("buy_"):
+        try:
+            game_chat_id = int(args[0].split("buy_", 1)[1])
+        except ValueError:
+            await update.message.reply_text("Некорректная ссылка на оплату.")
+            return
+        game = GAMES.get(game_chat_id)
+        if not game or not game.is_lose():
+            await update.message.reply_text("Оплата больше не актуальна.")
+            return
+        participants = ATTEMPTS.get(game_chat_id, {})
+        if user.id not in participants:
+            await update.message.reply_text("Оплата доступна только участникам этой игры.")
+            return
+        await _offer_extra_attempt(
+            update=update,
+            context=context,
+            game_chat_id=game_chat_id,
+            user_id=user.id,
+            invoice_chat_id=update.effective_chat.id,
+        )
+        return
 
     await update.message.reply_text(
         "🎮 Как играть в «Виселицу»\n\n"
@@ -890,7 +949,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != ChatType.PRIVATE:
-        await update.message.reply_text("Команда доступна только в личных сообщениях с ботом.")
+        chat_id = update.effective_chat.id
+        bot_username = context.bot.username
+        if chat_id in GAMES:
+            await update.message.reply_text(
+                f"{escape_markdown('Игра уже идёт. Текущий прогресс ниже.', 2)}\n{GAMES[chat_id].progress_message()}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        deep_link = f"https://t.me/{bot_username}?start=ask_{chat_id}"
+        await update.message.reply_text(
+            f"Кто загадывает слово — перейдите по ссылке в личку бота:\n{deep_link}\n"
+            "Там введите секретное слово.",
+            disable_web_page_preview=True,
+        )
         return
     with _db_connect() as conn:
         _upsert_user(conn, update.effective_user)
@@ -901,7 +973,13 @@ async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != ChatType.PRIVATE:
-        await update.message.reply_text("Команда доступна только в личных сообщениях с ботом.")
+        bot_username = context.bot.username
+        deep_link = f"https://t.me/{bot_username}?start=playbot"
+        await update.effective_message.reply_text(
+            "Играть с ботом можно в личке. Откройте чат по ссылке:\n"
+            f"{deep_link}",
+            disable_web_page_preview=True,
+        )
         return
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -1011,7 +1089,7 @@ async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TY
     _, chat_id_str, user_id_str = payload.split(":", 2)
     chat_id = int(chat_id_str)
     user_id = int(user_id_str)
-    if update.effective_chat.id != chat_id or update.effective_user.id != user_id:
+    if update.effective_user.id != user_id:
         return
 
     game = GAMES.get(chat_id)
@@ -1026,6 +1104,12 @@ async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TY
         f"{escape_markdown('✅ Добавлена 1 попытка. Продолжаем!', 2)}\n{game.progress_message()}",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
+    if update.effective_chat.id != chat_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{escape_markdown('✅ Добавлена 1 попытка. Продолжаем!', 2)}\n{game.progress_message()}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
 
 async def on_lose_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1033,15 +1117,15 @@ async def on_lose_choice_callback(update: Update, context: ContextTypes.DEFAULT_
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    if LOSE_CHOICE_PENDING.get(chat_id) != user_id:
-        await query.message.reply_text("Игра уже завершена или не найдена.")
-        return
-
     game = GAMES.get(chat_id)
     if not game:
         await query.message.reply_text("Игра не найдена.")
-        LOSE_CHOICE_PENDING.pop(chat_id, None)
         return
+
+    if update.effective_chat.type == ChatType.PRIVATE:
+        if LOSE_CHOICE_PENDING.get(chat_id) != user_id:
+            await query.message.reply_text("Игра уже завершена или не найдена.")
+            return
 
     if query.data == BUY_ATTEMPT_CB:
         await _offer_extra_attempt(update, context, chat_id, user_id)
@@ -1151,6 +1235,14 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         return
 
     if (
+        update.effective_chat.type != ChatType.PRIVATE
+        and game.is_lose()
+        and EXTRA_PAYMENT_PENDING.get(chat_id)
+    ):
+        await _prompt_group_lose_choice(update, context, chat_id)
+        return
+
+    if (
         update.effective_chat.type == ChatType.PRIVATE
         and LOSE_CHOICE_PENDING.get(chat_id) == user.id
     ):
@@ -1250,6 +1342,9 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
             LOSE_CHOICE_PENDING[chat_id] = user.id
             await _prompt_lose_choice(update)
             return
+        await _prompt_group_lose_choice(update, context, chat_id)
+        EXTRA_PAYMENT_PENDING[chat_id] = user.id
+        return
         await _finalize_loss(update, chat_id, game)
         return
 
@@ -1379,6 +1474,13 @@ def _mentioned_this_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     # На всякий случай fallback по строке
     return f"@{context.bot.username.lower()}" in (update.message.text or "").lower()
 
+def _is_share_command(text: str, bot_username: str) -> bool:
+    match = re.match(r"^/share(?:@(\w+))?\b", text.strip(), flags=re.IGNORECASE)
+    if not match:
+        return False
+    target = match.group(1)
+    return target is not None and target.lower() == bot_username.lower()
+
 async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
@@ -1387,6 +1489,20 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     chat_id = update.effective_chat.id
     bot_username = context.bot.username
+    if _is_share_command(text, bot_username):
+        if chat_id in GAMES:
+            await msg.reply_text(
+                f"{escape_markdown('Игра уже идёт. Текущий прогресс ниже.', 2)}\n{GAMES[chat_id].progress_message()}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        deep_link = f"https://t.me/{bot_username}?start=ask_{chat_id}"
+        await msg.reply_text(
+            f"Кто загадывает слово — перейдите по ссылке в личку бота:\n{deep_link}\n"
+            "Там введите секретное слово.",
+            disable_web_page_preview=True,
+        )
+        return
     # Ветка старта: достаточно просто упомянуть бота
     if _mentioned_this_bot(update, context) and not ACTIVE_GAME.get(chat_id):
         if chat_id in GAMES:
