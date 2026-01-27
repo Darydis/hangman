@@ -504,7 +504,7 @@ async def _prompt_lose_choice(update: Update) -> None:
         "Ты использовал(а) все попытки 😬\n\n"
         "Хочешь продолжить игру?\n\n"
         "⭐ +1 попытка — 5 Stars\n"
-        "❌ Завершить игру\n"
+        "❌ Узнать слово\n"
         "🎮 Новая игра",
         reply_markup=_lose_choice_keyboard(),
     )
