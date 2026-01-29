@@ -152,6 +152,7 @@ class HangmanGame:
         return (
             f"```\n{self.gallows()}\n```\n"
             f"Слово: `{self.masked()}`\n"
+            f"Верные буквы: `{guessed_sorted}`\n"
             f"Ошибки `({len(self.wrong)}/{self.max_attempts})`: `{wrong_sorted}`"
         )
 

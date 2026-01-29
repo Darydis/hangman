@@ -13,6 +13,7 @@ if not hasattr(inspect, "getargspec"):
 
     inspect.getargspec = _getargspec  # type: ignore[attr-defined]
 
+import asyncio
 import logging
 import os
 import random
@@ -27,8 +28,7 @@ from telegram import (
     Update,
     MessageEntity,
     BotCommand,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -44,11 +44,13 @@ from telegram.ext import (
     MessageHandler,
     PreCheckoutQueryHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     filters,
 )
 from telegram.helpers import escape_markdown
 
 from hangman.core import HangmanGame, is_letter, normalize_letter, render_gallows
+from metrics import track_event
 
 load_dotenv()
 
@@ -213,6 +215,26 @@ MORPH = pymorphy2.MorphAnalyzer()
 ATTEMPTS: Dict[int, Dict[int, int]] = {}
 
 DB_PATH = os.getenv("HANGMAN_DB_PATH", "hangman.db")
+
+def _emit_event(
+    event_name: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session_id: str | None = None,
+    game_id: str | None = None,
+    properties: dict | None = None,
+    payment: dict | None = None,
+) -> None:
+    asyncio.create_task(
+        track_event(
+            event_name=event_name,
+            user_id=update.effective_user.id,
+            session_id=session_id,
+            game_id=game_id,
+            properties=properties,
+            payment=payment,
+        )
+    )
 
 def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -479,12 +501,6 @@ def _record_last_play_word(conn: sqlite3.Connection, user_id: int, word: str) ->
 def _today_key() -> str:
     return _day_key_from_date(datetime.now(timezone.utc))
 
-def _play_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton(PLAY_BUTTON_TEXT)]],
-        resize_keyboard=True,
-    )
-
 def _replay_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(REPLAY_TEXT, callback_data=REPLAY_CB)]]
@@ -562,6 +578,20 @@ async def _offer_extra_attempt(
             currency=EXTRA_ATTEMPT_CURRENCY,
             prices=prices,
         )
+        _emit_event(
+            "invoice_sent",
+            update,
+            context,
+            session_id=str(game_chat_id),
+            game_id=str(game_chat_id),
+            payment={
+                "type": "stars",
+                "amount": EXTRA_ATTEMPT_PRICE,
+                "currency": EXTRA_ATTEMPT_CURRENCY,
+                "invoice_id": payload,
+                "status": "sent",
+            },
+        )
     except Exception as exc:
         EXTRA_PAYMENT_PENDING.pop(game_chat_id, None)
         await update.effective_message.reply_text(
@@ -578,7 +608,7 @@ async def _finalize_loss(
     game: HangmanGame,
     show_replay: bool = True,
 ) -> None:
-    word_key = _normalize_phrase(game.secret)
+    word_key = _normalize_game_word(game.secret)
     participants = ATTEMPTS.get(chat_id, {})
     with _db_connect() as conn:
         _record_game_results(conn, chat_id, word_key, participants, None)
@@ -838,6 +868,19 @@ async def _send_daily_word(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     user = update.effective_user
+    _emit_event(
+        "bot_open",
+        update,
+        context,
+        session_id=str(update.effective_chat.id),
+        properties={"args": args},
+    )
+    _emit_event(
+        "command_start",
+        update,
+        context,
+        session_id=str(update.effective_chat.id),
+    )
     with _db_connect() as conn:
         _upsert_user(conn, user)
     if args and len(args) >= 1 and args[0].startswith("ask_"):
@@ -870,6 +913,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         _start_game(chat_id=chat_id, secret=secret, host_user_id=user.id)
         GAME_SHARED_TOKEN[chat_id] = token
+        _emit_event(
+            "game_start",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+            properties={"mode": "shared_link", "secret_length": len(secret)},
+        )
         await update.message.reply_text(
             f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -892,6 +943,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
         GAME_DAILY_DATE[chat_id] = day_key
+        _emit_event(
+            "game_start",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+            properties={"mode": "daily_deeplink", "secret_length": len(word_key)},
+        )
         await update.message.reply_text(
             f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -951,7 +1010,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 "/daily — одно общее слово для всех на сегодня.\n\n"
 "Статистика по слову:\n"
 "/stats <слово> — кто угадывал, за сколько попыток, рекорды.",
-        reply_markup=_play_keyboard(),
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -1009,6 +1068,14 @@ async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
         return
     _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
+    _emit_event(
+        "game_start",
+        update,
+        context,
+        session_id=str(chat_id),
+        game_id=str(chat_id),
+        properties={"mode": "private_play", "secret_length": len(word_key)},
+    )
     await update.message.reply_text(
         f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -1033,12 +1100,27 @@ async def _start_group_play_game(update: Update, context: ContextTypes.DEFAULT_T
         _record_play_word(conn, word_key)
         _record_last_play_word(conn, user.id, word_key)
     _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
+    _emit_event(
+        "game_start",
+        update,
+        context,
+        session_id=str(chat_id),
+        game_id=str(chat_id),
+        properties={"mode": "group_play", "secret_length": len(word_key)},
+    )
     await update.effective_message.reply_text(
         f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
         parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _emit_event(
+        "command_play",
+        update,
+        context,
+        session_id=str(update.effective_chat.id),
+    )
     if update.effective_chat.type == ChatType.PRIVATE:
         await _start_bot_game(update, context)
         return
@@ -1066,12 +1148,26 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
     GAME_DAILY_DATE[chat_id] = day_key
+    _emit_event(
+        "game_start",
+        update,
+        context,
+        session_id=str(chat_id),
+        game_id=str(chat_id),
+        properties={"mode": "daily", "secret_length": len(word_key)},
+    )
     await update.message.reply_text(
         f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _emit_event(
+        "command_stats",
+        update,
+        context,
+        session_id=str(update.effective_chat.id),
+    )
     args = context.args or []
     if not args:
         await update.message.reply_text("Использование: /stats <слово>")
@@ -1112,6 +1208,13 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
+    _emit_event(
+        "invoice_opened",
+        update,
+        context,
+        session_id=str(update.effective_chat.id),
+        properties={"invoice_id": query.invoice_payload},
+    )
     if query.invoice_payload.startswith("extra_attempt:"):
         await query.answer(ok=True)
     else:
@@ -1127,6 +1230,28 @@ async def on_successful_payment(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = int(user_id_str)
     if update.effective_user.id != user_id:
         return
+
+    _emit_event(
+        "payment_success",
+        update,
+        context,
+        session_id=str(chat_id),
+        game_id=str(chat_id),
+        payment={
+            "type": "stars",
+            "amount": payment.total_amount,
+            "currency": payment.currency,
+            "invoice_id": payload,
+            "status": "success",
+        },
+    )
+    _emit_event(
+        "extra_attempt_bought",
+        update,
+        context,
+        session_id=str(chat_id),
+        game_id=str(chat_id),
+    )
 
     game = GAMES.get(chat_id)
     EXTRA_PAYMENT_PENDING.pop(chat_id, None)
@@ -1170,6 +1295,12 @@ async def on_lose_choice_callback(update: Update, context: ContextTypes.DEFAULT_
         await _finalize_loss(update, chat_id, game)
         return
     if query.data == NEW_GAME_CB:
+        _emit_event(
+            "new_game_clicked",
+            update,
+            context,
+            session_id=str(chat_id),
+        )
         await _finalize_loss(update, chat_id, game, show_replay=False)
         if update.effective_chat.type == ChatType.PRIVATE:
             await _start_bot_game(update, context)
@@ -1180,6 +1311,12 @@ async def on_lose_choice_callback(update: Update, context: ContextTypes.DEFAULT_
 async def on_replay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    _emit_event(
+        "new_game_clicked",
+        update,
+        context,
+        session_id=str(update.effective_chat.id),
+    )
     if update.effective_chat.type == ChatType.PRIVATE:
         await _start_bot_game(update, context)
         return
@@ -1313,6 +1450,14 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
 
         _increment_attempt(chat_id, user.id)
         is_correct, is_win, is_lose = game.guess(letter)
+        _emit_event(
+            "letter_guess",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+            properties={"letter": letter, "is_correct": is_correct},
+        )
     else:
         secret_script = _secret_script(game.secret)
         if secret_script:
@@ -1324,8 +1469,31 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         is_win = _normalize_phrase(guess_text) == _normalize_phrase(game.secret)
         is_lose = not is_win
         is_correct = is_win
+        _emit_event(
+            "word_guessed",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+            properties={"guess": guess_text, "is_correct": is_correct},
+        )
 
     if is_win:
+        _emit_event(
+            "game_win",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+        )
+        _emit_event(
+            "game_end",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+            properties={"result": "win"},
+        )
         shared_token = GAME_SHARED_TOKEN.get(chat_id)
         if shared_token:
             SHARED_PLAYED.setdefault(shared_token, set()).add(user.id)
@@ -1333,7 +1501,7 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         if daily_key:
             with _db_connect() as conn:
                 _record_daily_play(conn, daily_key, user.id)
-        word_key = _normalize_phrase(game.secret)
+        word_key = _normalize_game_word(game.secret)
         participants = ATTEMPTS.get(chat_id, {})
         winner_attempts = participants.get(user.id, 0)
         with _db_connect() as conn:
@@ -1385,14 +1553,41 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         return
 
     if is_lose:
+        _emit_event(
+            "game_lose",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+        )
+        _emit_event(
+            "game_end",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+            properties={"result": "lose"},
+        )
         if update.effective_chat.type == ChatType.PRIVATE:
             LOSE_CHOICE_PENDING[chat_id] = user.id
+            _emit_event(
+                "extra_attempt_offer_shown",
+                update,
+                context,
+                session_id=str(chat_id),
+                game_id=str(chat_id),
+            )
             await _prompt_lose_choice(update)
             return
         await _prompt_group_lose_choice(update, context, chat_id)
         EXTRA_PAYMENT_PENDING[chat_id] = user.id
-        return
-        await _finalize_loss(update, chat_id, game)
+        _emit_event(
+            "extra_attempt_offer_shown",
+            update,
+            context,
+            session_id=str(chat_id),
+            game_id=str(chat_id),
+        )
         return
 
     # Промежуточный прогресс
@@ -1492,6 +1687,14 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Заводим игру
     game = _start_game(chat_id=chat_id, secret=secret, host_user_id=user_id)
     del WAITING_WORD[user_id]
+    _emit_event(
+        "game_start",
+        update,
+        context,
+        session_id=str(chat_id),
+        game_id=str(chat_id),
+        properties={"mode": "group", "secret_length": len(secret)},
+    )
 
     # Сообщение в группу
     try:
@@ -1499,6 +1702,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chat_id=chat_id,
             text=f"{escape_markdown('🧩 Слово загадано!', 2)}\n{game.progress_message()}",
             parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=ReplyKeyboardRemove(),
         )
         await update.message.reply_text("Готово! Я объявил игру в группе. Пусть друзья начинают угадывать буквы 😊")
     except Exception as e:
@@ -1535,6 +1739,26 @@ def _is_play_command(text: str, bot_username: str) -> bool:
     target = match.group(1)
     return target is None or target.lower() == bot_username.lower()
 
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик добавления бота в чат — убираем старые reply-клавиатуры"""
+    chat_member = update.my_chat_member
+    if not chat_member:
+        return
+    new_status = chat_member.new_chat_member.status
+    old_status = chat_member.old_chat_member.status
+    # Бот был добавлен в чат (member или administrator)
+    if old_status in ["left", "kicked"] and new_status in ["member", "administrator"]:
+        chat_id = update.effective_chat.id
+        if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Привет! Я бот для игры в «Виселицу». Просто упомяните меня, чтобы начать игру.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            except Exception:
+                pass
+
 async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
@@ -1551,6 +1775,7 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await msg.reply_text(
                 f"{escape_markdown('Игра уже идёт. Текущий прогресс ниже.', 2)}\n{GAMES[chat_id].progress_message()}",
                 parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=ReplyKeyboardRemove(),
             )
             return
         deep_link = f"https://t.me/{bot_username}?start=ask_{chat_id}"
@@ -1558,6 +1783,7 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Кто загадывает слово — перейдите по ссылке в личку бота:\n{deep_link}\n"
             "Там введите секретное слово.",
             disable_web_page_preview=True,
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
     # Ветка старта: достаточно просто упомянуть бота
@@ -1566,6 +1792,7 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await msg.reply_text(
                 f"{escape_markdown('Игра уже идёт. Текущий прогресс ниже.', 2)}\n{GAMES[chat_id].progress_message()}",
                 parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=ReplyKeyboardRemove(),
             )
             return
         deep_link = f"https://t.me/{bot_username}?start=ask_{chat_id}"
@@ -1573,6 +1800,7 @@ async def on_group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Кто загадывает слово — перейдите по ссылке в личку бота:\n{deep_link}\n"
             "Там введите секретное слово.",
             disable_web_page_preview=True,
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -1642,6 +1870,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_lose_choice_callback, pattern=f"^{BUY_ATTEMPT_CB}$|^{END_GAME_CB}$|^{NEW_GAME_CB}$"))
     app.add_handler(CallbackQueryHandler(on_replay_callback, pattern=f"^{REPLAY_CB}$"))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment))
+    
+    # Обработчик добавления бота в чат
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Приватные сообщения — ввод секретного слова
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, on_private_text))

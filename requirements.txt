@@ -4,3 +4,4 @@ pytest>=7.4,<9
 pymorphy2
 pymorphy2-dicts-ru
 wordfreq
+httpx
