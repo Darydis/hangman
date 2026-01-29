@@ -225,6 +225,8 @@ def _emit_event(
     properties: dict | None = None,
     payment: dict | None = None,
 ) -> None:
+    if not update.effective_user:
+        return
     asyncio.create_task(
         track_event(
             event_name=event_name,
@@ -1208,13 +1210,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
-    _emit_event(
-        "invoice_opened",
-        update,
-        context,
-        session_id=str(update.effective_chat.id),
-        properties={"invoice_id": query.invoice_payload},
-    )
+    if update.effective_chat:
+        _emit_event(
+            "invoice_opened",
+            update,
+            context,
+            session_id=str(update.effective_chat.id),
+            properties={"invoice_id": query.invoice_payload},
+        )
     if query.invoice_payload.startswith("extra_attempt:"):
         await query.answer(ok=True)
     else:
