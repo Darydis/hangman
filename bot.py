@@ -1062,12 +1062,12 @@ async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         word_key = _choose_play_word(conn, user.id)
         word_key = _normalize_game_word(word_key) if word_key else None
         if not word_key:
-            await update.message.reply_text("Сейчас нет доступных слов. Попробуйте позже.")
+            await update.effective_message.reply_text("Сейчас нет доступных слов. Попробуйте позже.")
             return
         _record_play_word(conn, word_key)
         _record_last_play_word(conn, user.id, word_key)
     if ACTIVE_GAME.get(chat_id):
-        await update.message.reply_text("У вас уже идёт игра. Сначала завершите её.")
+        await update.effective_message.reply_text("У вас уже идёт игра. Сначала завершите её.")
         return
     _start_game(chat_id=chat_id, secret=word_key, host_user_id=user.id)
     _emit_event(
