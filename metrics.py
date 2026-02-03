@@ -23,6 +23,7 @@ def _build_url(base: Optional[str]) -> Optional[str]:
 async def track_event(
     event_name: str,
     user_id: int,
+    username: str | None = None,
     session_id: str | None = None,
     game_id: str | None = None,
     properties: dict | None = None,
@@ -38,6 +39,8 @@ async def track_event(
         "user_id": user_id,
         "timestamp": int(time.time() * 1000),
     }
+    if username is not None:
+        payload["username"] = username
     if session_id is not None:
         payload["session_id"] = session_id
     if game_id is not None:

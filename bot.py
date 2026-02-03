@@ -231,6 +231,7 @@ def _emit_event(
         track_event(
             event_name=event_name,
             user_id=update.effective_user.id,
+            username=update.effective_user.username,
             session_id=session_id,
             game_id=game_id,
             properties=properties,
