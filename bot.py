@@ -378,7 +378,7 @@ def _fetch_known_words(conn: sqlite3.Connection) -> List[str]:
 
 def _fetch_user_guessed_words(conn: sqlite3.Connection, user_id: int) -> Set[str]:
     rows = conn.execute(
-        "SELECT DISTINCT word FROM games WHERE user_id = ? AND result = 'win'",
+        "SELECT DISTINCT word FROM games WHERE user_id = ?",
         (user_id,),
     ).fetchall()
     return {_normalize_game_word(row["word"]) for row in rows if row["word"]}
@@ -392,13 +392,8 @@ def _choose_daily_word(conn: sqlite3.Connection, day_key: str) -> str:
     pool = known_words if known_words else [_normalize_game_word(word) for word in FALLBACK_WORDS]
     if not pool:
         return "слово"
-    try:
-        day = datetime.strptime(day_key, "%Y%m%d")
-    except ValueError:
-        day = datetime.now(timezone.utc)
-    yesterday_key = _day_key_from_date(day - timedelta(days=1))
-    last_word = _get_daily_word(conn, yesterday_key)
-    candidates = [w for w in pool if w != last_word] or pool
+    used_daily = {_normalize_game_word(w) for w in _fetch_daily_words(conn)}
+    candidates = [w for w in pool if w not in used_daily] or pool
     return random.choice(candidates)
 
 def _choose_play_word(conn: sqlite3.Connection, user_id: int) -> Optional[str]:
@@ -765,22 +760,9 @@ async def _post_game_stats(
     if not previous_record or previous_record["best_attempts"] is None:
         return
 
-    is_new_record = winner_attempts < previous_record["best_attempts"]
     word_label = word_display.upper()
 
     with _db_connect() as conn:
-        winner_label = _get_user_label(conn, winner_user_id)
-        if is_new_record:
-            text = (
-                "🎉 Новый рекорд!\n"
-                f"{winner_label} угадал(а) слово «{word_label}» за {winner_attempts} попыток — быстрее всех!"
-            )
-            await update.message.reply_text(
-                escape_markdown(text, 2),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            return
-
         best_user_id = updated_record.get("best_user_id")
         worst_user_id = updated_record.get("worst_user_id")
         best_attempts = updated_record.get("best_attempts")
@@ -795,14 +777,14 @@ async def _post_game_stats(
         champion = _get_user_label(conn, int(best_user_id))
         outsider = _get_user_label(conn, int(worst_user_id))
 
-    text = "\n".join(
-        [
-            f"✅ Слово «{word_label}» угадано за {winner_attempts} попыток",
-            f"🏆 Чемпион: {champion} — {best_attempts} попыток",
-            f"🐌 Аутсайдер: {outsider} — {worst_attempts} попыток",
-            f"📊 Всего игр с этим словом: {total_games}",
-        ]
-    )
+    lines = [
+        f"✅ Слово «{word_label}» угадано — {winner_attempts} {_format_attempts(winner_attempts)}",
+        f"🏆 Чемпион: {champion} — {best_attempts} {_format_attempts(best_attempts)}",
+    ]
+    if best_user_id != worst_user_id:
+        lines.append(f"🐌 Аутсайдер: {outsider} — {worst_attempts} {_format_attempts(worst_attempts)}")
+    lines.append(f"📊 Всего игр с этим словом: {total_games}")
+    text = "\n".join(lines)
     await update.message.reply_text(
         escape_markdown(text, 2),
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -829,9 +811,9 @@ async def _post_word_stats(
     word_label = word_display.upper()
     lines = [f"📊 Статистика по слову «{word_label}»"]
     if best_attempts is not None and best_user_id is not None:
-        lines.append(f"🏆 Чемпион: {champion} — {best_attempts} попыток")
-    if worst_attempts is not None and worst_user_id is not None:
-        lines.append(f"🐌 Аутсайдер: {outsider} — {worst_attempts} попыток")
+        lines.append(f"🏆 Чемпион: {champion} — {best_attempts} {_format_attempts(best_attempts)}")
+    if worst_attempts is not None and worst_user_id is not None and worst_user_id != best_user_id:
+        lines.append(f"🐌 Аутсайдер: {outsider} — {worst_attempts} {_format_attempts(worst_attempts)}")
     lines.append(f"📊 Всего игр с этим словом: {total_games}")
     await update.effective_message.reply_text(
         escape_markdown("\n".join(lines), 2),
@@ -1079,7 +1061,7 @@ async def _start_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         game_id=str(chat_id),
         properties={"mode": "private_play", "secret_length": len(word_key)},
     )
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"{escape_markdown('🧩 Игра началась!', 2)}\n{GAMES[chat_id].progress_message()}",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -1199,7 +1181,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "\n".join(
         [
             f"Статистика по слову «{word}»:",
-            f"🏆 Рекорд: {best_attempts} ({best_label})" if best_attempts is not None else "🏆 Рекорд: —",
+            f"🏆 Рекорд: {best_attempts} {_format_attempts(best_attempts)} ({best_label})" if best_attempts is not None else "🏆 Рекорд: —",
             f"💀 Не справились: {total_losers}",
             f"👥 Игроков: {total_players}",
         ]
@@ -1351,13 +1333,13 @@ def _normalize_phrase(s: str) -> str:
 
 def _format_attempts(count: int) -> str:
     if 11 <= count % 100 <= 14:
-        return "попыток"
+        return "промахов"
     last = count % 10
     if last == 1:
-        return "попытку"
+        return "промах"
     if 2 <= last <= 4:
-        return "попытки"
-    return "попыток"
+        return "промаха"
+    return "промахов"
 
 def _to_nominative_phrase(phrase: str) -> str:
     tokens = re.split(r"(\s+|-)", phrase)
@@ -1507,7 +1489,7 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
                 _record_daily_play(conn, daily_key, user.id)
         word_key = _normalize_game_word(game.secret)
         participants = ATTEMPTS.get(chat_id, {})
-        winner_attempts = participants.get(user.id, 0)
+        winner_attempts = len(game.wrong)
         with _db_connect() as conn:
             previous_record = _fetch_word_record(conn, word_key)
             _record_game_results(conn, chat_id, word_key, participants, user.id)
@@ -1516,9 +1498,16 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
             total_players = len(leaderboard)
             record_line = ""
             place_line = ""
-            if previous_record and previous_record["best_attempts"] is not None and previous_record["best_user_id"] is not None:
+            is_new_record = (
+                previous_record is not None
+                and previous_record["best_attempts"] is not None
+                and winner_attempts < previous_record["best_attempts"]
+            )
+            if is_new_record:
+                record_line = "🏆 Новый рекорд! Вы — чемпион!"
+            elif previous_record and previous_record["best_attempts"] is not None and previous_record["best_user_id"] is not None:
                 record_label = _get_user_label(conn, int(previous_record["best_user_id"]))
-                record_line = f"🏆 Рекорд: {previous_record['best_attempts']} ({record_label})"
+                record_line = f"🏆 Рекорд: {previous_record['best_attempts']} {_format_attempts(previous_record['best_attempts'])} ({record_label})"
             if total_players > 1:
                 place = next(
                     (idx + 1 for idx, (uid, _) in enumerate(leaderboard) if uid == user.id),
@@ -1527,7 +1516,7 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
                 place_line = f"Вы на {place} месте из {total_players}"
 
         display_word = _to_nominative_phrase(game.secret)
-        lines = [f"🎉 Вы угадали слово «{display_word}» за {winner_attempts} {_format_attempts(winner_attempts)}"]
+        lines = [f"🎉 Вы угадали слово «{display_word}» — {winner_attempts} {_format_attempts(winner_attempts)}"]
         if record_line:
             lines.append(record_line)
         if place_line:
@@ -1554,6 +1543,8 @@ async def _process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         ATTEMPTS.pop(chat_id, None)
         GAME_SHARED_TOKEN.pop(chat_id, None)
         GAME_DAILY_DATE.pop(chat_id, None)
+        EXTRA_PAYMENT_PENDING.pop(chat_id, None)
+        LOSE_CHOICE_PENDING.pop(chat_id, None)
         return
 
     if is_lose:
